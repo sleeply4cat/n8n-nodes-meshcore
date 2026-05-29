@@ -49,7 +49,7 @@
 		"@liamcottle/meshcore.js": "^1.13.0",
 		"@n8n/node-cli": "*",
 		"esbuild": "^0.28.0",
-		"eslint": "9.29.0",
+		"eslint": "10.4.0",
 		"prettier": "3.8.3",
 		"release-it": "20.0.1",
 		"typescript": "5.9.3"
