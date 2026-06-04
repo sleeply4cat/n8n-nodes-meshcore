@@ -68,6 +68,19 @@ queued messages and emits one item per message, routed by type (direct/channel/c
 data). Draining always consumes the whole device queue, so select every message type you
 care about on a single trigger node. Each emitted item is tagged with an `event` field.
 
+### Channel message fields
+
+The firmware formats channel (group) messages as `"<sender>: <text>"`. For the
+`channelMessage` event the trigger splits that into separate fields so you don't have to
+parse it in the workflow:
+
+- `author` — the sender's node name (empty if the message has no `"<name>: "` prefix)
+- `text` — the message body with the prefix removed
+- `rawText` — the original combined string, unchanged
+
+The split is on the first `": "`, so a `": "` inside the message body stays in `text`.
+Direct messages are emitted unchanged.
+
 ## Common patterns
 
 These combined operations turn the "send now, result arrives later" protocol flows into a
@@ -118,8 +131,16 @@ npm run lint
 npm test             # node:test; pretest builds, tests run against dist/
 ```
 
-To try it in a local n8n: `npm run build && npm link`, then in `~/.n8n/custom`
-run `npm link n8n-nodes-meshcore`, and restart n8n.
+The quickest way to try it in a local n8n with a ready-to-use account is
+`scripts/dev-n8n.sh`: it builds the plugin, launches n8n with the node loaded
+(`N8N_CUSTOM_EXTENSIONS`), and provisions a known owner via env so there's no setup
+screen — login `test@meshcore.local` / `Meshcore123` at <http://localhost:5678> (Ctrl+C
+to stop). `N8N_USER_MANAGEMENT_DISABLED` was removed from n8n, so a pre-provisioned owner
+(`N8N_INSTANCE_OWNER_MANAGED_BY_ENV` + a bcrypt password hash) is the supported way to get
+a fixed dev login.
+
+Manual alternative: `npm run build && npm link`, then in `~/.n8n/custom` run
+`npm link n8n-nodes-meshcore`, and restart n8n.
 
 ## Manual device test checklist
 
@@ -129,7 +150,8 @@ Run once against real hardware to validate the device-dependent paths:
 2. **Round-trip** — Device → *Get Self Info* (exercises the AppStart handshake).
 3. **Send** — Message → *Send Direct Message* to a known contact (expects a SENT reply).
 4. **Receive** — MeshCore Trigger → *New Message*; send the device a message and confirm
-   the workflow fires.
+   the workflow fires. For channel messages, `scripts/device-listen-channel.mjs <host>
+   <port>` prints the parsed `author` / `text` / `rawText` fields.
 5. **Lists** — Contact → *Get Contacts*; Channel → *Get Many*.
 6. **Diagnostics** — Diagnostics → *Get Status* / *Trace Path* (binary-request path).
 7. **Gap-command responses (least-verified)** — confirm these parse correctly:

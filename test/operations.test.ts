@@ -224,8 +224,28 @@ test('startMessageStream emits both direct and channel when both selected', () =
 
 	assert.deepEqual(events, [
 		{ event: 'directMessage', payload: { text: 'dm' } },
-		{ event: 'channelMessage', payload: { text: 'ch' } },
+		// channel text has no "<nick>: " prefix here, so author is empty and text == rawText
+		{ event: 'channelMessage', payload: { text: 'ch', author: '', rawText: 'ch' } },
 	]);
+});
+
+test('channelMessage splits "<nick>: <text>" into author, text, rawText', () => {
+	const conn = new FakeConn({});
+	const events: Array<{ event: string; payload: any }> = [];
+
+	startMessageStream(conn as any, ['channelMessage'], (event, payload) =>
+		events.push({ event, payload }),
+	);
+	conn.deliverMessage({
+		channelMessage: { channelIdx: 0, text: 'Alice: hello: world' },
+	});
+
+	assert.equal(events.length, 1);
+	const { payload } = events[0];
+	assert.equal(payload.author, 'Alice', 'nick taken before the first ": "');
+	assert.equal(payload.text, 'hello: world', 'remaining text after the first ": "');
+	assert.equal(payload.rawText, 'Alice: hello: world', 'full original kept as rawText');
+	assert.equal(payload.channelIdx, 0, 'other fields preserved');
 });
 
 test('contact:getAll returns an array of contacts', async () => {

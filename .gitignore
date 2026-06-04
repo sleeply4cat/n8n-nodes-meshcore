@@ -4,3 +4,7 @@ dist
 *.tsbuildinfo
 .DS_Store
 *.log
+
+# local n8n dev instance data (scripts/dev-n8n.sh)
+.n8n-dev/
+.n8n-node-cli/
