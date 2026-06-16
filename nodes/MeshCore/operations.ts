@@ -1,4 +1,5 @@
 import type { IDataObject, IExecuteFunctions } from 'n8n-workflow';
+import { NodeOperationError } from 'n8n-workflow';
 
 import type { MeshConnection, SharedConnection } from '../shared/ConnectionManager';
 import { bytesToHex, hexToBytes, normalizeBytesDeep } from '../shared/params';
@@ -85,38 +86,188 @@ const num = (ctx: IExecuteFunctions, name: string, i: number): number =>
 	Number(ctx.getNodeParameter(name, i));
 
 /**
- * Resolve with the first incoming direct message from `targetPublicKey` (matched by the
- * 6-byte sender prefix) within the timeout, else null. Arm this BEFORE sending so a fast
- * reply is not missed. Uses the connection's shared message-hub.
+ * Arm a reply watcher BEFORE sending, then call `wait(timeoutMs)` to bound how long to
+ * wait for the first incoming direct message from `targetPublicKey` (matched by the
+ * 6-byte sender prefix; meshcore.js's raw `pubKeyPrefix` field — renamed only at the
+ * output normalizer). The watcher uses the shared message-hub, so concurrent triggers
+ * still receive every message. Call `cancel()` if you abandon the wait (e.g. on send
+ * failure) so the subscription is released.
  */
+interface ReplyWatcher {
+	wait(timeoutMs: number): Promise<IDataObject | null>;
+	cancel(): void;
+}
+
+function startReplyWatcher(conn: SharedConnection, targetPublicKey: Buffer): ReplyWatcher {
+	const prefixHex = bytesToHex(targetPublicKey.subarray(0, 6));
+	let buffered: IDataObject | null = null;
+	let pendingResolve: ((value: IDataObject | null) => void) | null = null;
+	let cancelled = false;
+
+	const unsubscribe = conn.subscribeMessages((message) => {
+		if (cancelled) {
+			return;
+		}
+		const contactMessage = (message as { contactMessage?: { pubKeyPrefix?: unknown } })
+			?.contactMessage;
+		if (!contactMessage?.pubKeyPrefix) {
+			return;
+		}
+		if (bytesToHex(contactMessage.pubKeyPrefix as Uint8Array) !== prefixHex) {
+			return;
+		}
+		const normalized = normalizeBytesDeep(contactMessage) as IDataObject;
+		if (pendingResolve) {
+			const resolve = pendingResolve;
+			pendingResolve = null;
+			resolve(normalized);
+		} else if (buffered === null) {
+			buffered = normalized;
+		}
+	});
+
+	// internal teardown: just stop listening + flag. Kept separate from the public cancel
+	// so the wait-resolve path can use it without re-entering its own pending-resolve.
+	const teardown = () => {
+		if (cancelled) {
+			return;
+		}
+		cancelled = true;
+		unsubscribe();
+	};
+
+	return {
+		wait: (timeoutMs) =>
+			new Promise<IDataObject | null>((resolve) => {
+				if (buffered !== null) {
+					const value = buffered;
+					buffered = null;
+					teardown();
+					resolve(value);
+					return;
+				}
+				if (cancelled) {
+					resolve(null);
+					return;
+				}
+				const timer = setTimeout(() => {
+					pendingResolve = null;
+					teardown();
+					resolve(null);
+				}, timeoutMs);
+				pendingResolve = (value) => {
+					clearTimeout(timer);
+					teardown();
+					resolve(value);
+				};
+			}),
+		cancel: () => {
+			teardown();
+			if (pendingResolve) {
+				const resolve = pendingResolve;
+				pendingResolve = null;
+				resolve(null);
+			}
+		},
+	};
+}
+
 function awaitReply(
 	conn: SharedConnection,
 	targetPublicKey: Buffer,
 	timeoutMs: number,
 ): Promise<IDataObject | null> {
-	const prefixHex = bytesToHex(targetPublicKey.subarray(0, 6));
-	return new Promise((resolve) => {
-		let done = false;
-		const finish = (value: IDataObject | null) => {
-			if (done) {
-				return;
+	return startReplyWatcher(conn, targetPublicKey).wait(timeoutMs);
+}
+
+interface ReliableSendOptions {
+	publicKey: Buffer;
+	message: string;
+	txtType: number;
+	pathRetries: number;
+	floodRetries: number;
+	forceFlood: boolean;
+	perAttemptTimeoutMs: number;
+}
+
+interface ReliableSendResult {
+	delivered: boolean;
+	ackCode: number | null;
+	attempts: number;
+	phase: 'path' | 'flood' | null;
+	roundTrip: number | null;
+	lastSent: unknown;
+}
+
+/**
+ * Send a direct text message with retry policy that mirrors the MeshCore app: a path
+ * phase (up to N attempts using the stored route, if any) followed by a flood phase
+ * (M attempts after a path reset, since the device will keep using the cached route
+ * until it's cleared). Each attempt re-arms a fresh SendConfirmed listener bound to the
+ * fresh ackCode returned by sendTextMessage, then waits up to `perAttemptTimeoutMs`
+ * for that specific ack. Retries fire immediately on timeout (no backoff). When
+ * `forceFlood` is set, the path phase is skipped after an upfront resetPath.
+ */
+async function reliableSend(
+	conn: SharedConnection,
+	opts: ReliableSendOptions,
+): Promise<ReliableSendResult> {
+	const { publicKey, message, txtType, pathRetries, floodRetries, forceFlood, perAttemptTimeoutMs } =
+		opts;
+	let attempts = 0;
+	let lastSent: unknown = null;
+
+	const tryPhase = async (
+		phase: 'path' | 'flood',
+		maxAttempts: number,
+	): Promise<ReliableSendResult | null> => {
+		for (let i = 0; i < maxAttempts; i++) {
+			attempts++;
+			const expect = conn.expectPush<{ ackCode: number; roundTrip: number }>(
+				PushCodes.SendConfirmed,
+			);
+			try {
+				lastSent = await call(conn, 'sendTextMessage', publicKey, message, txtType);
+				const ackCode = Number((lastSent as { expectedAckCrc?: number })?.expectedAckCrc);
+				const confirmed = await expect.match((p) => p.ackCode === ackCode, perAttemptTimeoutMs);
+				if (confirmed !== null) {
+					return {
+						delivered: true,
+						ackCode,
+						attempts,
+						phase,
+						roundTrip: confirmed.roundTrip,
+						lastSent,
+					};
+				}
+			} finally {
+				expect.cancel();
 			}
-			done = true;
-			clearTimeout(timer);
-			unsubscribe();
-			resolve(value);
-		};
-		const unsubscribe = conn.subscribeMessages((message) => {
-			const contactMessage = (message as { contactMessage?: { pubKeyPrefix?: unknown } })?.contactMessage;
-			if (!contactMessage?.pubKeyPrefix) {
-				return;
-			}
-			if (bytesToHex(contactMessage.pubKeyPrefix as Uint8Array) === prefixHex) {
-				finish(normalizeBytesDeep(contactMessage) as IDataObject);
-			}
-		});
-		const timer = setTimeout(() => finish(null), timeoutMs);
-	});
+		}
+		return null;
+	};
+
+	if (forceFlood) {
+		await call(conn, 'resetPath', publicKey);
+	} else if (pathRetries > 0) {
+		const result = await tryPhase('path', pathRetries);
+		if (result) {
+			return result;
+		}
+		// path phase exhausted: the cached route is stale or the contact is unreachable
+		// along it; clear it before falling back to flood (otherwise the device keeps
+		// re-using the same dead route on the next sendTextMessage).
+		await call(conn, 'resetPath', publicKey);
+	}
+
+	if (floodRetries > 0) {
+		const result = await tryPhase('flood', floodRetries);
+		if (result) {
+			return result;
+		}
+	}
+
+	return { delivered: false, ackCode: null, attempts, phase: null, roundTrip: null, lastSent };
 }
 
 /** Dispatch table keyed by `${resource}:${operation}`. */
@@ -252,34 +403,67 @@ export const operations: Record<string, OperationHandler> = {
 	'message:sendDirect': async (conn, ctx, i) => {
 		const publicKey = hexToBytes(str(ctx, 'contactPublicKey', i));
 		const txtType = Number(ctx.getNodeParameter('txtType', i, TxtTypes.Plain));
-		const result = await call(conn, 'sendTextMessage', publicKey, str(ctx, 'message', i), txtType);
-		return result ? asObject(result) : { sent: true };
-	},
-	'message:sendDirectAwaitDelivery': async (conn, ctx, i) => {
-		const publicKey = hexToBytes(str(ctx, 'contactPublicKey', i));
-		const txtType = Number(ctx.getNodeParameter('txtType', i, TxtTypes.Plain));
-		const timeoutMs = num(ctx, 'ackTimeoutMs', i) || 15000;
-		// arm the ack listener BEFORE sending so a fast confirmation is not missed
-		const expect = conn.expectPush<{ ackCode: number; roundTrip: number }>(PushCodes.SendConfirmed);
-		try {
-			const sent = (await call(conn, 'sendTextMessage', publicKey, str(ctx, 'message', i), txtType)) as {
-				expectedAckCrc?: number;
-			};
-			const ackCode = Number(sent?.expectedAckCrc);
-			const confirmed = await expect.match((p) => p.ackCode === ackCode, timeoutMs);
-			return {
-				...asObject(sent),
-				ackCode,
-				delivered: confirmed !== null,
-				roundTrip: confirmed?.roundTrip ?? null,
-			};
-		} finally {
-			expect.cancel(); // no-op if already matched/timed out
+		const reliableDelivery = ctx.getNodeParameter('reliableDelivery', i, false) as boolean;
+
+		if (!reliableDelivery) {
+			// fire-and-forget: one send, surface ackCode so the user can pass it to a
+			// later Await Delivery without translating field names.
+			const result = (await call(
+				conn,
+				'sendTextMessage',
+				publicKey,
+				str(ctx, 'message', i),
+				txtType,
+			)) as { expectedAckCrc?: number } | undefined;
+			if (!result) {
+				return { sent: true };
+			}
+			const ackCode = Number(result.expectedAckCrc);
+			return { ...asObject(result), ackCode: Number.isFinite(ackCode) ? ackCode : null };
 		}
+
+		// reliable mode: retry along path, then flood. Throws on final non-delivery so
+		// the node turns red; Continue On Fail still lets workflows branch on it as data.
+		// Defaults are passed to getNodeParameter explicitly: n8n throws "Could not get
+		// parameter" when a value isn't saved AND no default was supplied.
+		const perAttemptTimeoutMs = Number(ctx.getNodeParameter('ackTimeoutMs', i, 15000)) || 15000;
+		const pathRetries = Math.max(0, Number(ctx.getNodeParameter('pathRetries', i, 2)));
+		const floodRetries = Math.max(0, Number(ctx.getNodeParameter('floodRetries', i, 2)));
+		const forceFlood = ctx.getNodeParameter('forceFlood', i, false) as boolean;
+
+		const result = await reliableSend(conn, {
+			publicKey,
+			message: str(ctx, 'message', i),
+			txtType,
+			pathRetries,
+			floodRetries,
+			forceFlood,
+			perAttemptTimeoutMs,
+		});
+
+		if (!result.delivered) {
+			throw new NodeOperationError(
+				ctx.getNode(),
+				`MeshCore message delivery not confirmed after ${result.attempts} attempt(s)`,
+				{
+					itemIndex: i,
+					description: `Tried ${pathRetries} path + ${floodRetries} flood attempt(s)${forceFlood ? ' (force flood)' : ''}, ${perAttemptTimeoutMs}ms per attempt`,
+				},
+			);
+		}
+
+		return {
+			...asObject(result.lastSent),
+			ackCode: result.ackCode,
+			delivered: true,
+			phase: result.phase,
+			attempts: result.attempts,
+			roundTrip: result.roundTrip,
+		};
 	},
 	'message:awaitDelivery': async (conn, ctx, i) => {
 		const ackCode = num(ctx, 'ackCode', i);
-		const timeoutMs = num(ctx, 'ackTimeoutMs', i) || 15000;
+		const timeoutMs = Number(ctx.getNodeParameter('ackTimeoutMs', i, 15000)) || 15000;
 		const expect = conn.expectPush<{ ackCode: number; roundTrip: number }>(PushCodes.SendConfirmed);
 		const confirmed = await expect.match((p) => p.ackCode === ackCode, timeoutMs);
 		return { ackCode, delivered: confirmed !== null, roundTrip: confirmed?.roundTrip ?? null };
@@ -291,11 +475,53 @@ export const operations: Record<string, OperationHandler> = {
 	'message:sendDirectAwaitReply': async (conn, ctx, i) => {
 		const publicKey = hexToBytes(str(ctx, 'contactPublicKey', i));
 		const txtType = Number(ctx.getNodeParameter('txtType', i, TxtTypes.Plain));
-		const timeoutMs = num(ctx, 'replyTimeoutMs', i) || 30000;
-		const replyPromise = awaitReply(conn, publicKey, timeoutMs); // arm before sending
-		const sent = await call(conn, 'sendTextMessage', publicKey, str(ctx, 'message', i), txtType);
-		const reply = await replyPromise;
-		return { ...asObject(sent), replied: reply !== null, reply: reply ?? null };
+		const replyTimeoutMs = num(ctx, 'replyTimeoutMs', i) || 30000;
+		const reliableDelivery = ctx.getNodeParameter('reliableDelivery', i, false) as boolean;
+		// arm the reply watcher BEFORE any send so a fast reply during the send loop is buffered
+		const watcher = startReplyWatcher(conn, publicKey);
+		try {
+			if (reliableDelivery) {
+				const perAttemptTimeoutMs = Number(ctx.getNodeParameter('ackTimeoutMs', i, 15000)) || 15000;
+				const pathRetries = Math.max(0, Number(ctx.getNodeParameter('pathRetries', i, 2)));
+				const floodRetries = Math.max(0, Number(ctx.getNodeParameter('floodRetries', i, 2)));
+				const forceFlood = ctx.getNodeParameter('forceFlood', i, false) as boolean;
+				const send = await reliableSend(conn, {
+					publicKey,
+					message: str(ctx, 'message', i),
+					txtType,
+					pathRetries,
+					floodRetries,
+					forceFlood,
+					perAttemptTimeoutMs,
+				});
+				if (!send.delivered) {
+					throw new NodeOperationError(
+						ctx.getNode(),
+						`MeshCore message delivery not confirmed after ${send.attempts} attempt(s)`,
+						{
+							itemIndex: i,
+							description: `Tried ${pathRetries} path + ${floodRetries} flood attempt(s)${forceFlood ? ' (force flood)' : ''}, ${perAttemptTimeoutMs}ms per attempt`,
+						},
+					);
+				}
+				const reply = await watcher.wait(replyTimeoutMs);
+				return {
+					...asObject(send.lastSent),
+					ackCode: send.ackCode,
+					delivered: true,
+					phase: send.phase,
+					attempts: send.attempts,
+					roundTrip: send.roundTrip,
+					replied: reply !== null,
+					reply: reply ?? null,
+				};
+			}
+			const sent = await call(conn, 'sendTextMessage', publicKey, str(ctx, 'message', i), txtType);
+			const reply = await watcher.wait(replyTimeoutMs);
+			return { ...asObject(sent), replied: reply !== null, reply: reply ?? null };
+		} finally {
+			watcher.cancel();
+		}
 	},
 	'message:getWaiting': async (conn) => asObjectArray(await call(conn, 'getWaitingMessages')),
 	'message:syncNext': async (conn) => {
@@ -353,7 +579,7 @@ export const operations: Record<string, OperationHandler> = {
 	'diagnostics:getTelemetry': async (conn, ctx, i) =>
 		asObject(await call(conn, 'getTelemetry', hexToBytes(str(ctx, 'contactPublicKey', i)))),
 	'diagnostics:tracePath': async (conn, ctx, i) =>
-		asObject(await call(conn, 'tracePath', optionalHex(str(ctx, 'path', i)), num(ctx, 'extraTimeoutMillis', i))),
+		asObject(await call(conn, 'tracePath', optionalHex(str(ctx, 'path', i)), num(ctx, 'extraTimeoutMs', i))),
 	'diagnostics:getNeighbours': async (conn, ctx, i) =>
 		asObject(
 			await call(
@@ -363,7 +589,7 @@ export const operations: Record<string, OperationHandler> = {
 				num(ctx, 'count', i),
 				num(ctx, 'offset', i),
 				num(ctx, 'orderBy', i),
-				num(ctx, 'pubKeyPrefixLength', i),
+				num(ctx, 'publicKeyPrefixLength', i),
 			),
 		),
 	'diagnostics:sendBinaryRequest': async (conn, ctx, i) => {
@@ -372,7 +598,7 @@ export const operations: Record<string, OperationHandler> = {
 			'sendBinaryRequest',
 			hexToBytes(str(ctx, 'contactPublicKey', i)),
 			hexToBytes(str(ctx, 'requestData', i)),
-			num(ctx, 'extraTimeoutMillis', i),
+			num(ctx, 'extraTimeoutMs', i),
 		);
 		return { responseData: bytesToHex(responseData) };
 	},

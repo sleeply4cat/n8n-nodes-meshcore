@@ -102,6 +102,15 @@ class FakeConn {
 function fakeCtx(params: Record<string, unknown>): any {
 	return {
 		getNodeParameter: (name: string, _i?: number, def?: unknown) => params[name] ?? def,
+		// NodeOperationError needs a node-like object; the minimum n8n requires for the constructor.
+		getNode: () => ({
+			id: 'test-node',
+			name: 'TestNode',
+			type: 'meshCore',
+			typeVersion: 1,
+			position: [0, 0],
+			parameters: {},
+		}),
 	};
 }
 
@@ -175,12 +184,12 @@ test('device:getSelfInfo calls getSelfInfo and returns its object', async () => 
 	assert.deepEqual(result, { name: 'node1', timeout: 10000 });
 });
 
-test('message:sendDirect parses pubkey hex and sends with Plain type', async () => {
+test('message:sendDirect parses pubkey hex and surfaces ackCode from expectedAckCrc', async () => {
 	let captured: { pk: Uint8Array; text: string; type: number } | null = null;
 	const mesh = {
 		sendTextMessage: async (pk: Uint8Array, text: string, type: number) => {
 			captured = { pk, text, type };
-			return { expectedAck: 42 };
+			return { expectedAckCrc: 42 };
 		},
 	};
 	const conn = new FakeConn(mesh) as unknown as Parameters<(typeof operations)['message:sendDirect']>[0];
@@ -192,7 +201,7 @@ test('message:sendDirect parses pubkey hex and sends with Plain type', async () 
 	assert.equal(Buffer.from(captured!.pk).toString('hex'), 'a1b2c3d4e5f6');
 	assert.equal(captured!.text, 'hello');
 	assert.equal(captured!.type, 0); // TxtTypes.Plain
-	assert.deepEqual(result, { expectedAck: 42 });
+	assert.deepEqual(result, { expectedAckCrc: 42, ackCode: 42 });
 });
 
 test('startMessageStream routes only the selected message types (direct only)', () => {
@@ -227,6 +236,31 @@ test('startMessageStream emits both direct and channel when both selected', () =
 		// channel text has no "<nick>: " prefix here, so author is empty and text == rawText
 		{ event: 'channelMessage', payload: { text: 'ch', author: '', rawText: 'ch' } },
 	]);
+});
+
+test('startMessageStream decodes packed pathLen into via/hops/pathHashSize', () => {
+	const conn = new FakeConn({});
+	const events: Array<{ event: string; payload: any }> = [];
+	startMessageStream(conn as any, ['directMessage', 'channelMessage'], (event, payload) =>
+		events.push({ event, payload }),
+	);
+
+	// 0xFF sentinel → direct routing (no hops, no hash size)
+	conn.deliverMessage({ contactMessage: { text: 'd1', pathLen: 0xff } });
+	// pathLen=3 (low 6 bits) — 3 hops, 1-byte hashes
+	conn.deliverMessage({ contactMessage: { text: 'd2', pathLen: 3 } });
+	// pathLen=0x43 = 0b01000011 — 3 hops, 2-byte hashes (observed on live hw)
+	conn.deliverMessage({ channelMessage: { text: 'Bob: ch', pathLen: 0x43 } });
+
+	assert.equal(events[0].payload.via, 'direct');
+	assert.equal(events[0].payload.hops, 0);
+	assert.equal(events[0].payload.pathHashSize, undefined, 'no path-hash size on direct');
+	assert.equal(events[1].payload.via, 'flood');
+	assert.equal(events[1].payload.hops, 3);
+	assert.equal(events[1].payload.pathHashSize, 1);
+	assert.equal(events[2].payload.via, 'flood');
+	assert.equal(events[2].payload.hops, 3, 'low 6 bits of 0x43');
+	assert.equal(events[2].payload.pathHashSize, 2, 'high 2 bits of 0x43, plus 1');
 });
 
 test('channelMessage splits "<nick>: <text>" into author, text, rawText', () => {
@@ -332,7 +366,7 @@ test('diagnostics:getNeighbours forwards pagination args', async () => {
 		},
 	};
 	const conn = new FakeConn(mesh) as any;
-	const ctx = fakeCtx({ contactPublicKey: 'aabb', count: 5, offset: 2, orderBy: 1, pubKeyPrefixLength: 4 });
+	const ctx = fakeCtx({ contactPublicKey: 'aabb', count: 5, offset: 2, orderBy: 1, publicKeyPrefixLength: 4 });
 
 	await operations['diagnostics:getNeighbours'](conn, ctx, 0);
 
@@ -350,11 +384,16 @@ test('call() turns a bare (undefined) device-ERR rejection into a clear message'
 	);
 });
 
-test('message:sendDirectAwaitDelivery sends, then resolves delivered on matching ack', async () => {
+test('message:sendDirect (reliable) delivers on the first path attempt', async () => {
 	const conn = new FakeConn({ sendTextMessage: async () => ({ expectedAckCrc: 111 }) });
-	const p = operations['message:sendDirectAwaitDelivery'](
+	const p = operations['message:sendDirect'](
 		conn as any,
-		fakeCtx({ contactPublicKey: 'aa', message: 'hi', ackTimeoutMs: 1000 }),
+		fakeCtx({
+			contactPublicKey: 'aa',
+			message: 'hi',
+			reliableDelivery: true,
+			ackTimeoutMs: 1000,
+		}),
 		0,
 	);
 	conn.fire(0x82, { ackCode: 111, roundTrip: 50 }); // buffered until match
@@ -362,17 +401,104 @@ test('message:sendDirectAwaitDelivery sends, then resolves delivered on matching
 	assert.equal(r.delivered, true);
 	assert.equal(r.roundTrip, 50);
 	assert.equal(r.ackCode, 111);
+	assert.equal(r.phase, 'path');
+	assert.equal(r.attempts, 1);
 });
 
-test('message:sendDirectAwaitDelivery resolves delivered:false on timeout', async () => {
-	const conn = new FakeConn({ sendTextMessage: async () => ({ expectedAckCrc: 999 }) });
-	const r = (await operations['message:sendDirectAwaitDelivery'](
+test('message:sendDirect (reliable) throws NodeOperationError after all retries exhausted', async () => {
+	let sends = 0;
+	let resets = 0;
+	const conn = new FakeConn({
+		sendTextMessage: async () => {
+			sends++;
+			return { expectedAckCrc: 999 };
+		},
+		resetPath: async () => {
+			resets++;
+		},
+	});
+	await assert.rejects(
+		operations['message:sendDirect'](
+			conn as any,
+			fakeCtx({
+				contactPublicKey: 'aa',
+				message: 'hi',
+				reliableDelivery: true,
+				ackTimeoutMs: 5,
+				pathRetries: 2,
+				floodRetries: 1,
+			}),
+			0,
+		),
+		/delivery not confirmed/,
+	);
+	assert.equal(sends, 3, 'tries pathRetries + floodRetries sends');
+	assert.equal(resets, 1, 'resets the path once between phases');
+});
+
+test('message:sendDirect (reliable) delivers on the flood phase after path attempts fail', async () => {
+	let sends = 0;
+	let conn: FakeConn;
+	const mesh = {
+		sendTextMessage: async () => {
+			sends++;
+			// path attempt: don't ack (will time out). flood attempt (#2): fire ack so the
+			// expectPush armed inside reliableSend matches before its timeout fires.
+			if (sends === 2) {
+				setImmediate(() => conn.fire(0x82, { ackCode: 7, roundTrip: 12 }));
+			}
+			return { expectedAckCrc: 7 };
+		},
+		resetPath: async () => {},
+	};
+	conn = new FakeConn(mesh);
+	const r = (await operations['message:sendDirect'](
 		conn as any,
-		fakeCtx({ contactPublicKey: 'aa', message: 'hi', ackTimeoutMs: 10 }),
+		fakeCtx({
+			contactPublicKey: 'aa',
+			message: 'hi',
+			reliableDelivery: true,
+			ackTimeoutMs: 50,
+			pathRetries: 1,
+			floodRetries: 2,
+		}),
 		0,
 	)) as any;
-	assert.equal(r.delivered, false);
-	assert.equal(r.roundTrip, null);
+	assert.equal(r.delivered, true);
+	assert.equal(r.phase, 'flood', 'fell back to flood after path failed');
+	assert.equal(r.attempts, 2, 'one path attempt + one flood attempt');
+	assert.equal(sends, 2, 'sent twice (path miss + flood hit)');
+});
+
+test('message:sendDirect (reliable, forceFlood) resets path up front and skips path phase', async () => {
+	let resets = 0;
+	let conn: FakeConn;
+	const mesh = {
+		sendTextMessage: async () => {
+			setImmediate(() => conn.fire(0x82, { ackCode: 5, roundTrip: 1 }));
+			return { expectedAckCrc: 5 };
+		},
+		resetPath: async () => {
+			resets++;
+		},
+	};
+	conn = new FakeConn(mesh);
+	const r = (await operations['message:sendDirect'](
+		conn as any,
+		fakeCtx({
+			contactPublicKey: 'aa',
+			message: 'hi',
+			reliableDelivery: true,
+			ackTimeoutMs: 100,
+			pathRetries: 2,
+			floodRetries: 1,
+			forceFlood: true,
+		}),
+		0,
+	)) as any;
+	assert.equal(r.delivered, true);
+	assert.equal(r.phase, 'flood', 'force flood skips path phase');
+	assert.equal(resets, 1, 'one reset up front, none between phases');
 });
 
 test('message:awaitDelivery matches by ackCode', async () => {
@@ -385,16 +511,18 @@ test('message:awaitDelivery matches by ackCode', async () => {
 	assert.equal(r.roundTrip, 70);
 });
 
-test('diagnostics:discoverPath resolves the matching path response', async () => {
+test('diagnostics:discoverPath resolves the matching path response (renamed to publicKeyPrefix)', async () => {
 	const conn = new FakeConn({ sendPathDiscoveryReq: async () => ({ result: 1 }) });
 	const p = operations['diagnostics:discoverPath'](
 		conn as any,
 		fakeCtx({ contactPublicKey: 'aabbccddeeff00', resultTimeoutMs: 1000 }),
 		0,
 	);
+	// vendor extension emits `pubKeyPrefix` as the meshcore.js short form;
+	// the normalizer renames it to publicKeyPrefix on the output boundary.
 	conn.fire(0x8d, { pubKeyPrefix: 'aabbccddeeff', outPath: '', inPath: '' });
 	const r = (await p) as any;
-	assert.equal(r.pubKeyPrefix, 'aabbccddeeff');
+	assert.equal(r.publicKeyPrefix, 'aabbccddeeff');
 });
 
 test('message:sendDirectAwaitReply resolves with the contact reply', async () => {

@@ -94,8 +94,7 @@ const operationSelectors: INodeProperties[] = [
 			{ name: 'Await Delivery', value: 'awaitDelivery', action: 'Await a delivery confirmation', description: 'Wait for the delivery confirmation (ack) of an already-sent message' },
 			{ name: 'Get Waiting Messages', value: 'getWaiting', action: 'Get waiting messages', description: 'Drain all messages queued on the device' },
 			{ name: 'Send Channel Message', value: 'sendChannel', action: 'Send a channel message', description: 'Send a text message to a channel' },
-			{ name: 'Send Direct Message', value: 'sendDirect', action: 'Send a direct message', description: 'Send a text message to a contact by public key' },
-			{ name: 'Send Direct Message and Await Delivery', value: 'sendDirectAwaitDelivery', action: 'Send a direct message and await delivery', description: 'Send a direct message and wait for its delivery confirmation (ack)' },
+			{ name: 'Send Direct Message', value: 'sendDirect', action: 'Send a direct message', description: 'Send a text message to a contact by public key; enable Reliable Delivery for retries + delivery confirmation' },
 			{ name: 'Send Direct Message and Await Reply', value: 'sendDirectAwaitReply', action: 'Send a direct message and await reply', description: 'Send a direct message and wait for the contact to reply' },
 			{ name: 'Sync Next Message', value: 'syncNext', action: 'Sync the next message', description: 'Fetch the next single queued message' },
 		],
@@ -194,7 +193,6 @@ const fields: INodeProperties[] = [
 			['message', 'diagnostics', 'repeater'],
 			[
 				'sendDirect',
-				'sendDirectAwaitDelivery',
 				'sendDirectAwaitReply',
 				'getStatus',
 				'getTelemetry',
@@ -266,7 +264,7 @@ const fields: INodeProperties[] = [
 		default: '',
 		required: true,
 		description: 'Text to send',
-		displayOptions: showFor('message', ['sendDirect', 'sendChannel', 'sendDirectAwaitDelivery', 'sendDirectAwaitReply']),
+		displayOptions: showFor('message', ['sendDirect', 'sendChannel', 'sendDirectAwaitReply']),
 	},
 	{
 		displayName: 'Text Type',
@@ -279,7 +277,7 @@ const fields: INodeProperties[] = [
 			{ name: 'Signed Plain', value: 2 },
 		],
 		description: 'Message text type',
-		displayOptions: showFor('message', ['sendDirect', 'sendDirectAwaitDelivery', 'sendDirectAwaitReply']),
+		displayOptions: showFor('message', ['sendDirect', 'sendDirectAwaitReply']),
 	},
 	// channel index
 	{
@@ -430,7 +428,7 @@ const fields: INodeProperties[] = [
 	},
 	{
 		displayName: 'Extra Timeout (Ms)',
-		name: 'extraTimeoutMillis',
+		name: 'extraTimeoutMs',
 		type: 'number',
 		default: 1000,
 		description: 'Extra time to wait beyond the estimated round-trip',
@@ -467,7 +465,7 @@ const fields: INodeProperties[] = [
 	},
 	{
 		displayName: 'Public Key Prefix Length',
-		name: 'pubKeyPrefixLength',
+		name: 'publicKeyPrefixLength',
 		type: 'number',
 		default: 8,
 		description: 'Number of public key prefix bytes to return per neighbour',
@@ -598,12 +596,85 @@ const fields: INodeProperties[] = [
 		displayOptions: showFor('message', ['awaitDelivery']),
 	},
 	{
+		displayName: 'Reliable Delivery',
+		name: 'reliableDelivery',
+		type: 'boolean',
+		default: false,
+		description:
+			'Whether to send with delivery retries (path + flood phases) and wait for confirmation. On Send Direct Message, enabling this turns the node into a reliable-send: it throws on non-delivery (red status). On Send Direct Message and Await Reply, it also runs the retry+ack pipeline before listening for the reply.',
+		displayOptions: showFor('message', ['sendDirect', 'sendDirectAwaitReply']),
+	},
+	// Retry/timeout fields are shown when the operation supports them — either always
+	// (awaitDelivery needs ackTimeout) or gated on the Reliable Delivery toggle for
+	// sendDirect / sendDirectAwaitReply. Each field is declared once per show set;
+	// the displayOptions are kept simple (no `hide` clause) because n8n was matching
+	// `reliableDelivery: [false]` on operations where the param doesn't exist.
+	{
 		displayName: 'Ack Timeout (Ms)',
 		name: 'ackTimeoutMs',
 		type: 'number',
 		default: 15000,
-		description: 'How long to wait for the delivery confirmation',
-		displayOptions: showFor('message', ['sendDirectAwaitDelivery', 'awaitDelivery']),
+		description: 'How long to wait for the delivery confirmation per attempt',
+		displayOptions: showFor('message', ['awaitDelivery']),
+	},
+	{
+		displayName: 'Ack Timeout (Ms)',
+		name: 'ackTimeoutMs',
+		type: 'number',
+		default: 15000,
+		description: 'How long to wait for the delivery confirmation per attempt',
+		displayOptions: {
+			show: {
+				resource: ['message'],
+				operation: ['sendDirect', 'sendDirectAwaitReply'],
+				reliableDelivery: [true],
+			},
+		},
+	},
+	{
+		displayName: 'Path Retries',
+		name: 'pathRetries',
+		type: 'number',
+		default: 2,
+		description:
+			'How many times to send along the stored route before resetting it and falling back to flood routing',
+		displayOptions: {
+			show: {
+				resource: ['message'],
+				operation: ['sendDirect', 'sendDirectAwaitReply'],
+				reliableDelivery: [true],
+			},
+		},
+	},
+	{
+		displayName: 'Flood Retries',
+		name: 'floodRetries',
+		type: 'number',
+		default: 2,
+		description:
+			'How many times to retry by flooding (route reset) after the path phase is exhausted',
+		displayOptions: {
+			show: {
+				resource: ['message'],
+				operation: ['sendDirect', 'sendDirectAwaitReply'],
+				reliableDelivery: [true],
+			},
+		},
+	},
+	{
+		displayName: 'Force Flood',
+		name: 'forceFlood',
+		type: 'boolean',
+		default: false,
+		description:
+			'Whether to skip the path phase and reset the route before sending so the message goes via flood from the first attempt',
+		displayOptions: {
+			show: {
+				resource: ['message'],
+				operation: ['sendDirect', 'sendDirectAwaitReply'],
+				reliableDelivery: [true],
+			},
+		},
 	},
 	{
 		displayName: 'Reply Timeout (Ms)',

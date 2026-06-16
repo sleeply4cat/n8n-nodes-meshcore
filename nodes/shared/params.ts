@@ -18,9 +18,20 @@ export function bytesToHex(bytes: Uint8Array | number[]): string {
 }
 
 /**
+ * Map of meshcore.js short-form output keys to the long form used by this package's UI
+ * and outputs. Kept narrow: rename only fields where meshcore.js has a clear short-form
+ * variant of a name we use elsewhere in long form. Wider firmware shorthands (advLat,
+ * outPathLen, etc.) stay as-is — they have no dual form anywhere in the codebase.
+ */
+const KEY_RENAMES: Record<string, string> = {
+	pubKeyPrefix: 'publicKeyPrefix',
+};
+
+/**
  * Recursively convert byte fields (Uint8Array/Buffer, or serialized `{type:'Buffer'}`) to
  * lowercase hex strings so node output is consistent with the hex-string inputs the action
  * node accepts (public keys, secrets, paths, …). Plain number arrays are left untouched.
+ * Also applies KEY_RENAMES at every object level to unify naming on the output boundary.
  */
 export function normalizeBytesDeep(value: unknown): unknown {
 	if (value instanceof Uint8Array) {
@@ -38,7 +49,8 @@ export function normalizeBytesDeep(value: unknown): unknown {
 	}
 	const out: Record<string, unknown> = {};
 	for (const [key, val] of Object.entries(obj)) {
-		out[key] = normalizeBytesDeep(val);
+		const outKey = KEY_RENAMES[key] ?? key;
+		out[outKey] = normalizeBytesDeep(val);
 	}
 	return out;
 }

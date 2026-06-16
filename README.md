@@ -46,7 +46,7 @@ connection to the device.
 |---|---|
 | **Device** | Get Self Info, Get Battery Voltage, Get/Set/Sync Device Time, Set Advert Name, Set Advert Lat/Long, Set TX Power, Get Stats, Reboot, Set Device Pin, Get/Set Custom Variable(s), Get Tuning Parameters, Get Allowed Repeat Frequencies, Get/Set Auto Add Config, Set Path Hash Mode, Factory Reset |
 | **Contact** | Get Many, Get by Key, Get Advert Path, Find by Name, Find by Public Key Prefix, Add or Update, Set Path, Reset Path, Share, Export, Import, Remove |
-| **Message** | Send Direct Message, Send Direct Message and Await Delivery, Send Direct Message and Await Reply, Send Channel Message, Await Delivery, Get Waiting Messages, Sync Next Message |
+| **Message** | Send Direct Message (toggle: Reliable Delivery), Send Direct Message and Await Reply (toggle: Reliable Delivery), Send Channel Message, Await Delivery, Get Waiting Messages, Sync Next Message |
 | **Channel** | Get Channel, Get Many, Set, Delete, Send Data, Find by Name, Find by Secret |
 | **Advert** | Send Flood Advert, Send Zero-Hop Advert |
 | **Diagnostics** | Get Status, Get Telemetry, Get Neighbours, Trace Path, Send Binary Request, Send Path Discovery, Discover Path, Await Event |
@@ -81,16 +81,45 @@ parse it in the workflow:
 The split is on the first `": "`, so a `": "` inside the message body stays in `text`.
 Direct messages are emitted unchanged.
 
+### Routing fields on message events
+
+Both `directMessage` and `channelMessage` carry the firmware's `pathLen` byte. It's
+a packed value: `0xFF` is the sentinel for "delivered along a known route" (direct);
+otherwise the low 6 bits are the hop count and the high 2 bits encode the path-hash
+size (1–4 bytes per hop). The trigger decodes this into friendlier fields and **drops
+the raw `pathLen`** from the output:
+
+- `via` — `"direct"` if the message arrived along the stored route, `"flood"` otherwise.
+- `hops` — `0` for direct, the actual hop count for flood.
+- `pathHashSize` — only on flood, the bytes-per-hop hash size (1–4); useful for routing
+  debug.
+
+### Note on the New Advert event
+
+The `advert` event (auto-add mode, push 0x80) carries only the sender's `publicKey` —
+that is all the firmware emits in this push (the contact record itself is updated inside
+the device). Subscribe to **New Advert (Manual Add)** if you need the full record
+(`advName`, `advLat`, `advLon`, `outPath`, etc.); that push is only fired when the device
+is in manual-add mode.
+
 ## Common patterns
 
 These combined operations turn the "send now, result arrives later" protocol flows into a
 single synchronous node, so you don't need a second trigger plus shared state:
 
-- **Reliable send** — *Message → Send Direct Message and Await Delivery* sends a message and
-  waits for the recipient's ack. Returns `delivered: true/false` (false on timeout) plus
-  `roundTrip` and `ackCode`. Branch on `delivered` to react to a confirmation *or its absence*.
+- **Reliable send** — *Message → Send Direct Message* with the **Reliable Delivery**
+  toggle on. Mirrors the MeshCore app's retry policy: up to **Path Retries** attempts
+  along the stored route, then a forced `resetPath` and up to **Flood Retries** attempts
+  via flood routing. Each attempt has its own **Ack Timeout (Ms)** — retries fire
+  immediately on timeout, no backoff. Returns `delivered: true`, `phase: "path" | "flood"`,
+  `attempts`, `ackCode`, `roundTrip` on success. On final non-delivery the node **throws**
+  so it shows as a red error (use n8n's *Continue On Fail* if you want to branch on the
+  failure as data). The **Force Flood** toggle skips the path phase after an upfront
+  route reset. Toggle off = fire-and-forget: one send, return `ackCode`, no waiting.
 - **Request / reply** — *Message → Send Direct Message and Await Reply* sends a message and
-  waits for the contact's next reply (or times out). Great for ask-a-node chatbots.
+  waits for the contact's next reply (or times out). Its own **Reliable Delivery** toggle
+  runs the same retry+ack pipeline before starting the reply wait — useful for ask-a-node
+  chatbots where the question must land first. Toggle off = one send + wait for reply.
 - **Repeater admin** — *Repeater → Login* (guest = empty password, or admin password), then
   *Repeater → Send CLI Command* sends a CLI command and returns the repeater's response.
 - **Path discovery** — *Diagnostics → Discover Path* floods a discovery request and waits for
@@ -160,6 +189,28 @@ Run once against real hardware to validate the device-dependent paths:
    *Get by Key*.
 8. **Reconnect** — power-cycle/disconnect the device and confirm a running trigger
    reconnects and resumes.
+
+## Breaking changes (0.3.0)
+
+Field-name unification — workflows that read these specific keys from node output need
+to be updated:
+
+- Output key `pubKeyPrefix` is now `publicKeyPrefix` on every event/operation that emits
+  it (direct message, telemetry response, status response, login success, path discovery,
+  trace data, …). The 6-byte hex content is unchanged.
+- UI parameter `Public Key Prefix Length` on *Diagnostics → Get Neighbours* — the
+  parameter name was renamed from `pubKeyPrefixLength` to `publicKeyPrefixLength`
+  internally; the displayed name is unchanged. Existing nodes need to be re-opened so
+  n8n re-reads the default; node behavior is otherwise identical.
+- UI parameter `Extra Timeout (Ms)` on *Diagnostics → Trace Path* and *Send Binary
+  Request* — parameter name renamed from `extraTimeoutMillis` to `extraTimeoutMs`,
+  matching the suffix used by all other timeout fields. Same re-open caveat.
+
+*Reliable send* defaults: the new `pathRetries` (2) and `floodRetries` (2) mean a
+*Send Direct Message and Await Delivery* node that previously resolved `delivered: false`
+on timeout will now retry up to four times and then **throw** on final non-delivery (red
+status). Set both to 0 to restore single-attempt behavior, or use n8n's *Continue On
+Fail* to keep the failure as data.
 
 ## License
 

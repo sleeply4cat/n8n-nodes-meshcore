@@ -32,6 +32,33 @@ export function parseChannelMessage(inner: IDataObject): IDataObject {
 	return { ...inner, author, text, rawText };
 }
 
+/**
+ * Firmware sets `pathLen=0xFF` on messages that were delivered along a known route
+ * ("direct"). For flood-routed messages, `pathLen` is a PACKED byte (see firmware
+ * `Packet.h::getPathHashCount/getPathHashSize`): low 6 bits are the hop count, high 2
+ * bits are the path-hash size minus 1 (1..4 bytes per hop). Surface that as
+ * `via` / `hops` / `pathHashSize` so workflows don't have to know either the sentinel
+ * or the packing — and drop the raw `pathLen` byte from the output once decoded so
+ * consumers don't see a useless 255 on direct messages.
+ */
+function withRoutingFields(inner: IDataObject): IDataObject {
+	const pathLen = Number(inner.pathLen);
+	if (!Number.isFinite(pathLen)) {
+		return inner;
+	}
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	const { pathLen: _pathLen, ...rest } = inner;
+	if (pathLen === 0xff) {
+		return { ...rest, via: 'direct', hops: 0 };
+	}
+	return {
+		...rest,
+		via: 'flood',
+		hops: pathLen & 0x3f,
+		pathHashSize: (pathLen >> 6) + 1,
+	};
+}
+
 /** Emit a single drained message under its matching event, if that type is selected. */
 export function routeMessage(message: unknown, messageTypes: string[], emit: EmitFn): void {
 	if (!message || typeof message !== 'object') {
@@ -40,11 +67,11 @@ export function routeMessage(message: unknown, messageTypes: string[], emit: Emi
 	for (const [key, event] of Object.entries(MESSAGE_KEY_TO_EVENT)) {
 		const inner = (message as Record<string, unknown>)[key];
 		if (inner && messageTypes.includes(event)) {
-			const payload =
+			const base =
 				event === 'channelMessage'
 					? parseChannelMessage(inner as IDataObject)
 					: (inner as IDataObject);
-			emit(event, payload);
+			emit(event, withRoutingFields(base));
 		}
 	}
 }

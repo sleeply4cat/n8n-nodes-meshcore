@@ -1,6 +1,6 @@
 {
 	"name": "n8n-nodes-meshcore",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"description": "n8n community nodes for MeshCore devices over TCP/WiFi",
 	"license": "MIT",
 	"homepage": "https://github.com/sleeply4cat/n8n-nodes-meshcore",
