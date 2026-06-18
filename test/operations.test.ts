@@ -385,8 +385,17 @@ test('call() turns a bare (undefined) device-ERR rejection into a clear message'
 });
 
 test('message:sendDirect (reliable) delivers on the first path attempt', async () => {
-	const conn = new FakeConn({ sendTextMessage: async () => ({ expectedAckCrc: 111 }) });
-	const p = operations['message:sendDirect'](
+	let conn: FakeConn;
+	const mesh = {
+		// fire the ack right after the Sent response — mirrors how a real device
+		// produces SendConfirmed strictly AFTER returning RESP_CODE_SENT with the ackCode.
+		sendTextMessage: async () => {
+			setImmediate(() => conn.fire(0x82, { ackCode: 111, roundTrip: 50 }));
+			return { expectedAckCrc: 111 };
+		},
+	};
+	conn = new FakeConn(mesh);
+	const r = (await operations['message:sendDirect'](
 		conn as any,
 		fakeCtx({
 			contactPublicKey: 'aa',
@@ -395,9 +404,7 @@ test('message:sendDirect (reliable) delivers on the first path attempt', async (
 			ackTimeoutMs: 1000,
 		}),
 		0,
-	);
-	conn.fire(0x82, { ackCode: 111, roundTrip: 50 }); // buffered until match
-	const r = (await p) as any;
+	)) as any;
 	assert.equal(r.delivered, true);
 	assert.equal(r.roundTrip, 50);
 	assert.equal(r.ackCode, 111);
@@ -468,6 +475,53 @@ test('message:sendDirect (reliable) delivers on the flood phase after path attem
 	assert.equal(r.phase, 'flood', 'fell back to flood after path failed');
 	assert.equal(r.attempts, 2, 'one path attempt + one flood attempt');
 	assert.equal(sends, 2, 'sent twice (path miss + flood hit)');
+});
+
+test('message:sendDirect (reliable) accepts a late ack from a previous attempt and stops retrying', async () => {
+	// Real meshcore.js gives each sendTextMessage call a fresh expectedAckCrc.
+	// Bug: an ack from attempt #1 that arrives during attempt #2's wait was dropped
+	// because it didn't match attempt #2's ackCode, leading to spurious extra sends.
+	// Fix: cumulative ackCode set across all attempts.
+	let sendsAfterDelivered = 0;
+	let sends = 0;
+	let delivered = false;
+	let conn: FakeConn;
+	const mesh = {
+		sendTextMessage: async () => {
+			sends++;
+			if (delivered) sendsAfterDelivered++;
+			const ackCode = 100 + sends; // unique per attempt
+			if (sends === 1) {
+				// fire attempt #1's ack ~20ms AFTER attempt #1's timeout fires (10ms),
+				// i.e. mid-way through attempt #2's wait (also 10ms).
+				setTimeout(() => {
+					delivered = true;
+					conn.fire(0x82, { ackCode: 101, roundTrip: 42 });
+				}, 20);
+			}
+			return { expectedAckCrc: ackCode };
+		},
+		resetPath: async () => {},
+	};
+	conn = new FakeConn(mesh);
+	const r = (await operations['message:sendDirect'](
+		conn as any,
+		fakeCtx({
+			contactPublicKey: 'aa',
+			message: 'hi',
+			reliableDelivery: true,
+			ackTimeoutMs: 10,
+			pathRetries: 4,
+			floodRetries: 0,
+		}),
+		0,
+	)) as any;
+	assert.equal(r.delivered, true, 'late ack from a prior attempt counts as delivered');
+	assert.equal(r.ackCode, 101, 'matched ack belongs to attempt #1');
+	assert.equal(r.roundTrip, 42);
+	// give the loop one tick to confirm we did not push another send after the ack
+	await new Promise((res) => setTimeout(res, 30));
+	assert.equal(sendsAfterDelivered, 0, 'no spurious send after the ack was recognized');
 });
 
 test('message:sendDirect (reliable, forceFlood) resets path up front and skips path phase', async () => {

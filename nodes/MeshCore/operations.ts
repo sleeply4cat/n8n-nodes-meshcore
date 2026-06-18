@@ -203,10 +203,16 @@ interface ReliableSendResult {
  * Send a direct text message with retry policy that mirrors the MeshCore app: a path
  * phase (up to N attempts using the stored route, if any) followed by a flood phase
  * (M attempts after a path reset, since the device will keep using the cached route
- * until it's cleared). Each attempt re-arms a fresh SendConfirmed listener bound to the
- * fresh ackCode returned by sendTextMessage, then waits up to `perAttemptTimeoutMs`
- * for that specific ack. Retries fire immediately on timeout (no backoff). When
- * `forceFlood` is set, the path phase is skipped after an upfront resetPath.
+ * until it's cleared). Retries fire immediately on per-attempt timeout (no backoff).
+ * When `forceFlood` is set, the path phase is skipped after an upfront resetPath.
+ *
+ * Ack matching is CUMULATIVE: every attempt's `expectedAckCrc` is added to a shared
+ * set, and a single SendConfirmed subscriber resolves on the first push whose ackCode
+ * is in the set. This is important because meshcore.js stamps each sendTextMessage
+ * with a fresh `Date.now()`-based timestamp, so the firmware-side ackCrc is unique
+ * per attempt. An ack from attempt #1 that arrives during attempt #2's wait would
+ * otherwise be silently dropped (it doesn't match attempt #2's ackCode) and we'd
+ * keep retrying past an already-delivered message. The set lets the late ack land.
  */
 async function reliableSend(
 	conn: SharedConnection,
@@ -214,60 +220,100 @@ async function reliableSend(
 ): Promise<ReliableSendResult> {
 	const { publicKey, message, txtType, pathRetries, floodRetries, forceFlood, perAttemptTimeoutMs } =
 		opts;
+
+	const expectedAckCodes = new Set<number>();
+	const phaseByAck = new Map<number, 'path' | 'flood'>();
+	let confirmed: { ackCode: number; roundTrip: number } | null = null;
+	let pendingResolve: ((c: { ackCode: number; roundTrip: number }) => void) | null = null;
+
+	const unsubscribe = conn.subscribe(PushCodes.SendConfirmed, (raw) => {
+		if (confirmed !== null) {
+			return;
+		}
+		const payload = raw as { ackCode?: unknown; roundTrip?: unknown };
+		const ackCode = Number(payload.ackCode);
+		if (!Number.isFinite(ackCode) || !expectedAckCodes.has(ackCode)) {
+			return;
+		}
+		confirmed = { ackCode, roundTrip: Number(payload.roundTrip) };
+		if (pendingResolve) {
+			const resolve = pendingResolve;
+			pendingResolve = null;
+			resolve(confirmed);
+		}
+	});
+
+	const waitForAck = (timeoutMs: number) =>
+		new Promise<{ ackCode: number; roundTrip: number } | null>((resolve) => {
+			if (confirmed) {
+				resolve(confirmed);
+				return;
+			}
+			const timer = setTimeout(() => {
+				pendingResolve = null;
+				resolve(null);
+			}, timeoutMs);
+			pendingResolve = (c) => {
+				clearTimeout(timer);
+				resolve(c);
+			};
+		});
+
 	let attempts = 0;
 	let lastSent: unknown = null;
 
-	const tryPhase = async (
-		phase: 'path' | 'flood',
-		maxAttempts: number,
-	): Promise<ReliableSendResult | null> => {
-		for (let i = 0; i < maxAttempts; i++) {
-			attempts++;
-			const expect = conn.expectPush<{ ackCode: number; roundTrip: number }>(
-				PushCodes.SendConfirmed,
-			);
-			try {
-				lastSent = await call(conn, 'sendTextMessage', publicKey, message, txtType);
-				const ackCode = Number((lastSent as { expectedAckCrc?: number })?.expectedAckCrc);
-				const confirmed = await expect.match((p) => p.ackCode === ackCode, perAttemptTimeoutMs);
-				if (confirmed !== null) {
-					return {
-						delivered: true,
-						ackCode,
-						attempts,
-						phase,
-						roundTrip: confirmed.roundTrip,
-						lastSent,
-					};
-				}
-			} finally {
-				expect.cancel();
-			}
+	const finish = (phase: 'path' | 'flood' | null): ReliableSendResult => {
+		if (confirmed) {
+			return {
+				delivered: true,
+				ackCode: confirmed.ackCode,
+				attempts,
+				phase: phaseByAck.get(confirmed.ackCode) ?? phase,
+				roundTrip: confirmed.roundTrip,
+				lastSent,
+			};
 		}
-		return null;
+		return { delivered: false, ackCode: null, attempts, phase: null, roundTrip: null, lastSent };
 	};
 
-	if (forceFlood) {
-		await call(conn, 'resetPath', publicKey);
-	} else if (pathRetries > 0) {
-		const result = await tryPhase('path', pathRetries);
-		if (result) {
-			return result;
-		}
-		// path phase exhausted: the cached route is stale or the contact is unreachable
-		// along it; clear it before falling back to flood (otherwise the device keeps
-		// re-using the same dead route on the next sendTextMessage).
-		await call(conn, 'resetPath', publicKey);
-	}
+	try {
+		const tryPhase = async (phase: 'path' | 'flood', maxAttempts: number): Promise<boolean> => {
+			for (let i = 0; i < maxAttempts; i++) {
+				attempts++;
+				lastSent = await call(conn, 'sendTextMessage', publicKey, message, txtType);
+				const ackCode = Number((lastSent as { expectedAckCrc?: number })?.expectedAckCrc);
+				if (Number.isFinite(ackCode)) {
+					expectedAckCodes.add(ackCode);
+					phaseByAck.set(ackCode, phase);
+				}
+				const result = await waitForAck(perAttemptTimeoutMs);
+				if (result !== null) {
+					return true;
+				}
+			}
+			return false;
+		};
 
-	if (floodRetries > 0) {
-		const result = await tryPhase('flood', floodRetries);
-		if (result) {
-			return result;
+		if (forceFlood) {
+			await call(conn, 'resetPath', publicKey);
+		} else if (pathRetries > 0) {
+			if (await tryPhase('path', pathRetries)) {
+				return finish('path');
+			}
+			// path phase exhausted: the cached route is stale or the contact is unreachable
+			// along it; clear it before falling back to flood (otherwise the device keeps
+			// re-using the same dead route on the next sendTextMessage).
+			await call(conn, 'resetPath', publicKey);
 		}
-	}
 
-	return { delivered: false, ackCode: null, attempts, phase: null, roundTrip: null, lastSent };
+		if (floodRetries > 0 && (await tryPhase('flood', floodRetries))) {
+			return finish('flood');
+		}
+
+		return finish(null);
+	} finally {
+		unsubscribe();
+	}
 }
 
 /** Dispatch table keyed by `${resource}:${operation}`. */
