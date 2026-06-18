@@ -3,7 +3,7 @@ import { NodeOperationError } from 'n8n-workflow';
 
 import type { MeshConnection, SharedConnection } from '../shared/ConnectionManager';
 import { bytesToHex, hexToBytes, normalizeBytesDeep } from '../shared/params';
-import { PushCodes, TxtTypes } from '../shared/codes';
+import { PushCodes, ResponseCodes, TxtTypes } from '../shared/codes';
 
 /**
  * One action-node operation. Reads its parameters from the execution context for the
@@ -61,17 +61,46 @@ function asObjectArray(value: unknown): IDataObject[] {
 }
 
 /**
- * Normalize a contact: meshcore returns `outPath` as a fixed 64-byte buffer regardless of
- * `outPathLen`, so truncate it to the real path length before hex-encoding.
+ * Decode the firmware's packed `out_path_len` byte (same encoding as `pathLen` on
+ * received messages, see `Packet::isValidPathLen`):
+ *  - low 6 bits  = hop count
+ *  - high 2 bits = path-hash bytes per hop, minus 1 (so values 1..4)
+ *  - the special value `0xFF` (read as -1 via Int8) means `OUT_PATH_UNKNOWN` — no
+ *    route stored, the firmware will fall back to flood routing.
+ * Returns `null` for the unknown sentinel.
+ */
+function decodeOutPath(
+	outPathLen: number,
+): { hops: number; hashSize: number; bytes: number } | null {
+	if (!Number.isFinite(outPathLen) || outPathLen < 0 || outPathLen === 0xff) {
+		return null;
+	}
+	const hops = outPathLen & 0x3f;
+	const hashSize = (outPathLen >> 6) + 1;
+	return { hops, hashSize, bytes: hops * hashSize };
+}
+
+/**
+ * Normalize a contact for output:
+ *  - decode the packed `outPathLen` and truncate the 64-byte `outPath` to the real
+ *    byte length (`hops * hashSize`), so workflows don't see a tail of garbage zeros
+ *    from the contact's uninitialized stack memory on the device.
+ *  - add `outPathHops` and `outPathHashSize` so workflows can read them without
+ *    re-decoding the packed byte.
+ *  - emit empty `outPath` and `outPathHops: null` for the OUT_PATH_UNKNOWN sentinel.
  */
 function contactJson(contact: unknown): IDataObject {
 	if (contact && typeof contact === 'object') {
 		const c = { ...(contact as Record<string, unknown>) };
-		const len = Number(c.outPathLen);
+		const lenByte = Number(c.outPathLen);
+		const decoded = decodeOutPath(lenByte);
 		const path = c.outPath;
-		if ((path instanceof Uint8Array || Array.isArray(path)) && Number.isFinite(len)) {
-			c.outPath = Buffer.from(path as Uint8Array).subarray(0, Math.max(0, len));
+		if (path instanceof Uint8Array || Array.isArray(path)) {
+			const bytes = decoded?.bytes ?? 0;
+			c.outPath = Buffer.from(path as Uint8Array).subarray(0, bytes);
 		}
+		c.outPathHops = decoded ? decoded.hops : null;
+		c.outPathHashSize = decoded ? decoded.hashSize : null;
 		return asObject(c);
 	}
 	return asObject(contact);
@@ -187,6 +216,8 @@ interface ReliableSendOptions {
 	pathRetries: number;
 	floodRetries: number;
 	forceFlood: boolean;
+	/** When true (default), clear the cached route before the flood phase. */
+	resetPathOnFloodFallback: boolean;
 	perAttemptTimeoutMs: number;
 }
 
@@ -196,7 +227,88 @@ interface ReliableSendResult {
 	attempts: number;
 	phase: 'path' | 'flood' | null;
 	roundTrip: number | null;
-	lastSent: unknown;
+	lastSent: SentResponse | null;
+}
+
+interface SentResponse {
+	result: number;
+	expectedAckCrc: number;
+	estTimeout: number;
+}
+
+/**
+ * Send one CMD_SEND_TXT_MSG frame with explicit `attempt` and `senderTimestamp`,
+ * waiting for the device's RESP_CODE_SENT (or RESP_CODE_ERR). The pair drives the
+ * firmware's `expected_ack = sha256(timestamp || (attempt & 3) || text || senderKey)`
+ * computation (BaseChatMesh::composeMsgPacket): a stable timestamp across retries
+ * means the receiver recognizes the retries as the SAME logical message and does not
+ * surface duplicates in its UI, while the incremented attempt makes each on-air
+ * packet hash-unique so the mesh can flood every attempt without collapsing them.
+ *
+ * Uses meshcore.js's low-level `sendCommandSendTxtMsg` directly because the
+ * high-level `sendTextMessage` hardcodes `attempt = 0` and re-stamps a fresh
+ * `Date.now()` per call — which is what produced "duplicates on the receiver" when
+ * we used it for retries.
+ */
+async function sendTxtRaw(
+	conn: SharedConnection,
+	txtType: number,
+	attempt: number,
+	senderTimestamp: number,
+	publicKey: Buffer,
+	text: string,
+): Promise<SentResponse> {
+	return conn.run(
+		(c) =>
+			new Promise<SentResponse>((resolve, reject) => {
+				const off = () => {
+					c.off(ResponseCodes.Sent, onSent);
+					c.off(ResponseCodes.Err, onErr);
+				};
+				const onSent = (response: unknown) => {
+					off();
+					resolve(response as SentResponse);
+				};
+				const onErr = (response: unknown) => {
+					off();
+					const errCode = (response as { errCode?: unknown } | null)?.errCode;
+					reject(
+						new Error(
+							`MeshCore device returned ERR for SEND_TXT_MSG${errCode != null ? ` (errCode=${String(errCode)})` : ''}`,
+						),
+					);
+				};
+				c.once(ResponseCodes.Sent, onSent);
+				c.once(ResponseCodes.Err, onErr);
+
+				const fn = (c as Record<string, unknown>).sendCommandSendTxtMsg as
+					| ((
+							t: number,
+							a: number,
+							ts: number,
+							pk: Uint8Array,
+							txt: string,
+					  ) => Promise<void>)
+					| undefined;
+				if (typeof fn !== 'function') {
+					off();
+					reject(
+						new Error(
+							'meshcore.js does not implement "sendCommandSendTxtMsg" (needs a protocol extension)',
+						),
+					);
+					return;
+				}
+				fn.call(c, txtType, attempt, senderTimestamp, publicKey, text).catch((e: unknown) => {
+					off();
+					reject(
+						e instanceof Error
+							? e
+							: new Error('sendCommandSendTxtMsg failed: device returned an error or did not respond'),
+					);
+				});
+			}),
+	);
 }
 
 /**
@@ -206,20 +318,35 @@ interface ReliableSendResult {
  * until it's cleared). Retries fire immediately on per-attempt timeout (no backoff).
  * When `forceFlood` is set, the path phase is skipped after an upfront resetPath.
  *
- * Ack matching is CUMULATIVE: every attempt's `expectedAckCrc` is added to a shared
- * set, and a single SendConfirmed subscriber resolves on the first push whose ackCode
- * is in the set. This is important because meshcore.js stamps each sendTextMessage
- * with a fresh `Date.now()`-based timestamp, so the firmware-side ackCrc is unique
- * per attempt. An ack from attempt #1 that arrives during attempt #2's wait would
- * otherwise be silently dropped (it doesn't match attempt #2's ackCode) and we'd
- * keep retrying past an already-delivered message. The set lets the late ack land.
+ * Two safety nets for the ack handling:
+ *  1. A STABLE `senderTimestamp` is used for the whole logical send, and `attempt`
+ *     is monotonic — so the receiver de-duplicates retries instead of surfacing them
+ *     as separate messages to the user (see `sendTxtRaw` for the firmware contract).
+ *  2. Ack matching is CUMULATIVE: every attempt's `expectedAckCrc` (returned by the
+ *     device in RESP_CODE_SENT) goes into a shared set, and a single SendConfirmed
+ *     subscriber resolves on the first push whose ackCode is in that set. A late
+ *     ack from attempt #1 arriving during attempt #2's wait is recognized as
+ *     "delivered" and short-circuits the loop instead of being silently dropped.
  */
 async function reliableSend(
 	conn: SharedConnection,
 	opts: ReliableSendOptions,
 ): Promise<ReliableSendResult> {
-	const { publicKey, message, txtType, pathRetries, floodRetries, forceFlood, perAttemptTimeoutMs } =
-		opts;
+	const {
+		publicKey,
+		message,
+		txtType,
+		pathRetries,
+		floodRetries,
+		forceFlood,
+		resetPathOnFloodFallback,
+		perAttemptTimeoutMs,
+	} = opts;
+
+	// Stable timestamp for the WHOLE logical send. With matching `(timestamp, attempt&3,
+	// text)` across our retries, the receiver's firmware treats them as the same logical
+	// message and does not produce duplicates in its UI.
+	const senderTimestamp = Math.floor(Date.now() / 1000);
 
 	const expectedAckCodes = new Set<number>();
 	const phaseByAck = new Map<number, 'path' | 'flood'>();
@@ -260,7 +387,10 @@ async function reliableSend(
 		});
 
 	let attempts = 0;
-	let lastSent: unknown = null;
+	let lastSent: SentResponse | null = null;
+	// Monotonic attempt byte across the whole reliable send (firmware masks to 2 bits
+	// internally; we keep counting for the on-air payload hash to stay unique).
+	let attemptByte = 0;
 
 	const finish = (phase: 'path' | 'flood' | null): ReliableSendResult => {
 		if (confirmed) {
@@ -280,8 +410,15 @@ async function reliableSend(
 		const tryPhase = async (phase: 'path' | 'flood', maxAttempts: number): Promise<boolean> => {
 			for (let i = 0; i < maxAttempts; i++) {
 				attempts++;
-				lastSent = await call(conn, 'sendTextMessage', publicKey, message, txtType);
-				const ackCode = Number((lastSent as { expectedAckCrc?: number })?.expectedAckCrc);
+				lastSent = await sendTxtRaw(
+					conn,
+					txtType,
+					attemptByte++,
+					senderTimestamp,
+					publicKey,
+					message,
+				);
+				const ackCode = Number(lastSent.expectedAckCrc);
 				if (Number.isFinite(ackCode)) {
 					expectedAckCodes.add(ackCode);
 					phaseByAck.set(ackCode, phase);
@@ -301,9 +438,13 @@ async function reliableSend(
 				return finish('path');
 			}
 			// path phase exhausted: the cached route is stale or the contact is unreachable
-			// along it; clear it before falling back to flood (otherwise the device keeps
-			// re-using the same dead route on the next sendTextMessage).
-			await call(conn, 'resetPath', publicKey);
+			// along it. By default we clear it before falling back to flood — otherwise the
+			// firmware keeps using the same dead route on subsequent sendCommandSendTxtMsg
+			// calls and the flood phase isn't really "flood". Disabling this preserves the
+			// route (flood-phase attempts then proceed along the same path).
+			if (resetPathOnFloodFallback) {
+				await call(conn, 'resetPath', publicKey);
+			}
 		}
 
 		if (floodRetries > 0 && (await tryPhase('flood', floodRetries))) {
@@ -476,6 +617,11 @@ export const operations: Record<string, OperationHandler> = {
 		const pathRetries = Math.max(0, Number(ctx.getNodeParameter('pathRetries', i, 2)));
 		const floodRetries = Math.max(0, Number(ctx.getNodeParameter('floodRetries', i, 2)));
 		const forceFlood = ctx.getNodeParameter('forceFlood', i, false) as boolean;
+		const resetPathOnFloodFallback = ctx.getNodeParameter(
+			'resetPathOnFloodFallback',
+			i,
+			true,
+		) as boolean;
 
 		const result = await reliableSend(conn, {
 			publicKey,
@@ -484,6 +630,7 @@ export const operations: Record<string, OperationHandler> = {
 			pathRetries,
 			floodRetries,
 			forceFlood,
+			resetPathOnFloodFallback,
 			perAttemptTimeoutMs,
 		});
 
@@ -531,6 +678,11 @@ export const operations: Record<string, OperationHandler> = {
 				const pathRetries = Math.max(0, Number(ctx.getNodeParameter('pathRetries', i, 2)));
 				const floodRetries = Math.max(0, Number(ctx.getNodeParameter('floodRetries', i, 2)));
 				const forceFlood = ctx.getNodeParameter('forceFlood', i, false) as boolean;
+				const resetPathOnFloodFallback = ctx.getNodeParameter(
+					'resetPathOnFloodFallback',
+					i,
+					true,
+				) as boolean;
 				const send = await reliableSend(conn, {
 					publicKey,
 					message: str(ctx, 'message', i),
@@ -538,6 +690,7 @@ export const operations: Record<string, OperationHandler> = {
 					pathRetries,
 					floodRetries,
 					forceFlood,
+					resetPathOnFloodFallback,
 					perAttemptTimeoutMs,
 				});
 				if (!send.delivered) {

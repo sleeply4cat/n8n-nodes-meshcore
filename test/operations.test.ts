@@ -99,6 +99,45 @@ class FakeConn {
 	}
 }
 
+/**
+ * Mesh stub with EventEmitter semantics on numeric codes. Reliable-send tests need this
+ * because operations.ts now drives the low-level `sendCommandSendTxtMsg` directly and
+ * listens for ResponseCodes.Sent / .Err via `mesh.once(code, handler)` — same pattern
+ * meshcore.js itself uses internally.
+ */
+function makeEmitterMesh(): any {
+	const listeners = new Map<number, Set<(p: any) => void>>();
+	const m: any = {
+		on(code: number, h: any) {
+			let s = listeners.get(code);
+			if (!s) {
+				s = new Set();
+				listeners.set(code, s);
+			}
+			s.add(h);
+		},
+		once(code: number, h: any) {
+			const wrap = (p: any) => {
+				listeners.get(code)?.delete(wrap);
+				h(p);
+			};
+			let s = listeners.get(code);
+			if (!s) {
+				s = new Set();
+				listeners.set(code, s);
+			}
+			s.add(wrap);
+		},
+		off(code: number, h: any) {
+			listeners.get(code)?.delete(h);
+		},
+		emit(code: number, p: any) {
+			for (const h of [...(listeners.get(code) ?? [])]) h(p);
+		},
+	};
+	return m;
+}
+
 function fakeCtx(params: Record<string, unknown>): any {
 	return {
 		getNodeParameter: (name: string, _i?: number, def?: unknown) => params[name] ?? def,
@@ -148,17 +187,47 @@ test('action output normalizes byte fields to hex (getContacts publicKey)', asyn
 	assert.equal(result[0].advName, 'a');
 });
 
-test('contact output truncates outPath to outPathLen', async () => {
+test('contact output decodes packed outPathLen and trims outPath to real byte length', async () => {
+	// outPathLen is PACKED: low 6 bits = hops, high 2 bits = (hash size - 1). For
+	// outPathLen=0x43 = 0b01000011 that's 3 hops, 2-byte hashes → 6 real bytes.
+	// Earlier we used the raw byte (67) as length and the user saw 64 bytes of mostly
+	// zeros tailing the real 6 bytes of route (uninitialized device memory).
 	const outPath = new Uint8Array(64);
-	outPath[0] = 0x0a;
-	outPath[1] = 0x0b;
+	for (let i = 0; i < 6; i++) outPath[i] = 0xa0 + i;
+	// the trailing 58 bytes intentionally non-zero so a wrong slice would show them
+	for (let i = 6; i < 64; i++) outPath[i] = 0xee;
 	const mesh = {
-		getContactByKey: async () => ({ advName: 'r', outPathLen: 2, outPath, publicKey: Uint8Array.from([0x01]) }),
+		getContactByKey: async () => ({
+			advName: 'r',
+			outPathLen: 0x43,
+			outPath,
+			publicKey: Uint8Array.from([0x01]),
+		}),
 	};
 	const conn = new FakeConn(mesh) as any;
 	const r = (await operations['contact:getByKey'](conn, fakeCtx({ publicKey: 'aa' }), 0)) as any;
-	assert.equal(r.outPath, '0a0b', 'outPath truncated to outPathLen and hex-encoded');
-	assert.equal(r.publicKey, '01');
+	assert.equal(r.outPath, 'a0a1a2a3a4a5', 'outPath sized as hops*hashSize, no trailing garbage');
+	assert.equal(r.outPathHops, 3);
+	assert.equal(r.outPathHashSize, 2);
+});
+
+test('contact output: OUT_PATH_UNKNOWN (-1) produces empty outPath and null hops', async () => {
+	// meshcore.js reads outPathLen as Int8, so the 0xFF firmware sentinel arrives as -1.
+	const outPath = new Uint8Array(64);
+	outPath[0] = 0x55; // would-be garbage if the truncation were wrong
+	const mesh = {
+		getContactByKey: async () => ({
+			advName: 'orphan',
+			outPathLen: -1,
+			outPath,
+			publicKey: Uint8Array.from([0x02]),
+		}),
+	};
+	const conn = new FakeConn(mesh) as any;
+	const r = (await operations['contact:getByKey'](conn, fakeCtx({ publicKey: 'bb' }), 0)) as any;
+	assert.equal(r.outPath, '', 'no path stored → empty hex');
+	assert.equal(r.outPathHops, null);
+	assert.equal(r.outPathHashSize, null);
 });
 
 test('channel:getAll drops unconfigured (empty-name) channels', async () => {
@@ -384,15 +453,52 @@ test('call() turns a bare (undefined) device-ERR rejection into a clear message'
 	);
 });
 
+test('message:sendDirect (reliable) uses a stable timestamp and a monotonic attempt across retries', async () => {
+	// This is the protocol-level contract that lets the receiver de-dup retries:
+	// identical (senderTimestamp, attempt & 3, text) on every attempt → receiver's
+	// expected_ack hash is the same → no spurious duplicates in the contact's UI.
+	const sends: Array<{ attempt: number; ts: number }> = [];
+	let conn: FakeConn;
+	const mesh = makeEmitterMesh();
+	mesh.sendCommandSendTxtMsg = async (_t: number, attempt: number, ts: number) => {
+		sends.push({ attempt, ts });
+		const ackCode = 200 + sends.length;
+		setImmediate(() => mesh.emit(6, { result: 0, expectedAckCrc: ackCode, estTimeout: 0 }));
+	};
+	mesh.resetPath = async () => {};
+	conn = new FakeConn(mesh);
+	await assert.rejects(
+		operations['message:sendDirect'](
+			conn as any,
+			fakeCtx({
+				contactPublicKey: 'aa',
+				message: 'hi',
+				reliableDelivery: true,
+				ackTimeoutMs: 5,
+				pathRetries: 2,
+				floodRetries: 2,
+			}),
+			0,
+		),
+		/delivery not confirmed/,
+	);
+	assert.equal(sends.length, 4, 'two path + two flood attempts');
+	for (const s of sends) assert.equal(s.ts, sends[0].ts, 'all attempts share one senderTimestamp');
+	assert.deepEqual(
+		sends.map((s) => s.attempt),
+		[0, 1, 2, 3],
+		'attempt byte monotonically increases',
+	);
+});
+
 test('message:sendDirect (reliable) delivers on the first path attempt', async () => {
 	let conn: FakeConn;
-	const mesh = {
-		// fire the ack right after the Sent response — mirrors how a real device
-		// produces SendConfirmed strictly AFTER returning RESP_CODE_SENT with the ackCode.
-		sendTextMessage: async () => {
-			setImmediate(() => conn.fire(0x82, { ackCode: 111, roundTrip: 50 }));
-			return { expectedAckCrc: 111 };
-		},
+	const mesh = makeEmitterMesh();
+	mesh.sendCommandSendTxtMsg = async () => {
+		// device emits RESP_CODE_SENT with the expectedAckCrc, then the SendConfirmed
+		// push lands strictly afterwards (mirrors firmware response ordering).
+		setImmediate(() => mesh.emit(6, { result: 0, expectedAckCrc: 111, estTimeout: 0 }));
+		setImmediate(() => conn.fire(0x82, { ackCode: 111, roundTrip: 50 }));
 	};
 	conn = new FakeConn(mesh);
 	const r = (await operations['message:sendDirect'](
@@ -415,15 +521,15 @@ test('message:sendDirect (reliable) delivers on the first path attempt', async (
 test('message:sendDirect (reliable) throws NodeOperationError after all retries exhausted', async () => {
 	let sends = 0;
 	let resets = 0;
-	const conn = new FakeConn({
-		sendTextMessage: async () => {
-			sends++;
-			return { expectedAckCrc: 999 };
-		},
-		resetPath: async () => {
-			resets++;
-		},
-	});
+	const mesh = makeEmitterMesh();
+	mesh.sendCommandSendTxtMsg = async () => {
+		sends++;
+		setImmediate(() => mesh.emit(6, { result: 0, expectedAckCrc: 999, estTimeout: 0 }));
+	};
+	mesh.resetPath = async () => {
+		resets++;
+	};
+	const conn = new FakeConn(mesh);
 	await assert.rejects(
 		operations['message:sendDirect'](
 			conn as any,
@@ -446,18 +552,17 @@ test('message:sendDirect (reliable) throws NodeOperationError after all retries 
 test('message:sendDirect (reliable) delivers on the flood phase after path attempts fail', async () => {
 	let sends = 0;
 	let conn: FakeConn;
-	const mesh = {
-		sendTextMessage: async () => {
-			sends++;
-			// path attempt: don't ack (will time out). flood attempt (#2): fire ack so the
-			// expectPush armed inside reliableSend matches before its timeout fires.
-			if (sends === 2) {
-				setImmediate(() => conn.fire(0x82, { ackCode: 7, roundTrip: 12 }));
-			}
-			return { expectedAckCrc: 7 };
-		},
-		resetPath: async () => {},
+	const mesh = makeEmitterMesh();
+	mesh.sendCommandSendTxtMsg = async () => {
+		sends++;
+		setImmediate(() => mesh.emit(6, { result: 0, expectedAckCrc: 7, estTimeout: 0 }));
+		// path attempt: don't ack (will time out). flood attempt (#2): fire ack so the
+		// SendConfirmed subscriber inside reliableSend matches before its timeout fires.
+		if (sends === 2) {
+			setImmediate(() => conn.fire(0x82, { ackCode: 7, roundTrip: 12 }));
+		}
 	};
+	mesh.resetPath = async () => {};
 	conn = new FakeConn(mesh);
 	const r = (await operations['message:sendDirect'](
 		conn as any,
@@ -478,31 +583,29 @@ test('message:sendDirect (reliable) delivers on the flood phase after path attem
 });
 
 test('message:sendDirect (reliable) accepts a late ack from a previous attempt and stops retrying', async () => {
-	// Real meshcore.js gives each sendTextMessage call a fresh expectedAckCrc.
-	// Bug: an ack from attempt #1 that arrives during attempt #2's wait was dropped
-	// because it didn't match attempt #2's ackCode, leading to spurious extra sends.
-	// Fix: cumulative ackCode set across all attempts.
+	// Bug context: each attempt produces a (mostly) distinct expected_ack on real
+	// firmware. An ack from attempt #1 that arrives during attempt #2's wait must be
+	// recognized as "delivered" — not dropped because it doesn't match #2's ackCode.
 	let sendsAfterDelivered = 0;
 	let sends = 0;
 	let delivered = false;
 	let conn: FakeConn;
-	const mesh = {
-		sendTextMessage: async () => {
-			sends++;
-			if (delivered) sendsAfterDelivered++;
-			const ackCode = 100 + sends; // unique per attempt
-			if (sends === 1) {
-				// fire attempt #1's ack ~20ms AFTER attempt #1's timeout fires (10ms),
-				// i.e. mid-way through attempt #2's wait (also 10ms).
-				setTimeout(() => {
-					delivered = true;
-					conn.fire(0x82, { ackCode: 101, roundTrip: 42 });
-				}, 20);
-			}
-			return { expectedAckCrc: ackCode };
-		},
-		resetPath: async () => {},
+	const mesh = makeEmitterMesh();
+	mesh.sendCommandSendTxtMsg = async () => {
+		sends++;
+		if (delivered) sendsAfterDelivered++;
+		const ackCode = 100 + sends; // unique per attempt
+		setImmediate(() => mesh.emit(6, { result: 0, expectedAckCrc: ackCode, estTimeout: 0 }));
+		if (sends === 1) {
+			// fire attempt #1's ack ~20ms AFTER attempt #1's timeout fires (10ms),
+			// i.e. mid-way through attempt #2's wait (also 10ms).
+			setTimeout(() => {
+				delivered = true;
+				conn.fire(0x82, { ackCode: 101, roundTrip: 42 });
+			}, 20);
+		}
 	};
+	mesh.resetPath = async () => {};
 	conn = new FakeConn(mesh);
 	const r = (await operations['message:sendDirect'](
 		conn as any,
@@ -524,17 +627,48 @@ test('message:sendDirect (reliable) accepts a late ack from a previous attempt a
 	assert.equal(sendsAfterDelivered, 0, 'no spurious send after the ack was recognized');
 });
 
+test('message:sendDirect (reliable, resetPathOnFloodFallback=false) preserves the path between phases', async () => {
+	let resets = 0;
+	let sends = 0;
+	const mesh = makeEmitterMesh();
+	mesh.sendCommandSendTxtMsg = async () => {
+		sends++;
+		setImmediate(() => mesh.emit(6, { result: 0, expectedAckCrc: 1000 + sends, estTimeout: 0 }));
+	};
+	mesh.resetPath = async () => {
+		resets++;
+	};
+	const conn = new FakeConn(mesh);
+	await assert.rejects(
+		operations['message:sendDirect'](
+			conn as any,
+			fakeCtx({
+				contactPublicKey: 'aa',
+				message: 'hi',
+				reliableDelivery: true,
+				ackTimeoutMs: 5,
+				pathRetries: 1,
+				floodRetries: 1,
+				resetPathOnFloodFallback: false,
+			}),
+			0,
+		),
+		/delivery not confirmed/,
+	);
+	assert.equal(sends, 2, 'path + flood phase sends still happen');
+	assert.equal(resets, 0, 'no resetPath when the toggle is off');
+});
+
 test('message:sendDirect (reliable, forceFlood) resets path up front and skips path phase', async () => {
 	let resets = 0;
 	let conn: FakeConn;
-	const mesh = {
-		sendTextMessage: async () => {
-			setImmediate(() => conn.fire(0x82, { ackCode: 5, roundTrip: 1 }));
-			return { expectedAckCrc: 5 };
-		},
-		resetPath: async () => {
-			resets++;
-		},
+	const mesh = makeEmitterMesh();
+	mesh.sendCommandSendTxtMsg = async () => {
+		setImmediate(() => mesh.emit(6, { result: 0, expectedAckCrc: 5, estTimeout: 0 }));
+		setImmediate(() => conn.fire(0x82, { ackCode: 5, roundTrip: 1 }));
+	};
+	mesh.resetPath = async () => {
+		resets++;
 	};
 	conn = new FakeConn(mesh);
 	const r = (await operations['message:sendDirect'](

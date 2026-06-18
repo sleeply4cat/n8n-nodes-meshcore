@@ -677,6 +677,21 @@ const fields: INodeProperties[] = [
 		},
 	},
 	{
+		displayName: 'Reset Path on Flood Fallback',
+		name: 'resetPathOnFloodFallback',
+		type: 'boolean',
+		default: true,
+		description:
+			'Whether to clear the stored route to the contact when switching from path retries to flood retries. A stale route is the typical reason path attempts fail. Disable only to preserve the route; flood-phase retries then proceed without clearing it (firmware will keep using the same path).',
+		displayOptions: {
+			show: {
+				resource: ['message'],
+				operation: ['sendDirect', 'sendDirectAwaitReply'],
+				reliableDelivery: [true],
+			},
+		},
+	},
+	{
 		displayName: 'Reply Timeout (Ms)',
 		name: 'replyTimeoutMs',
 		type: 'number',
