@@ -3,6 +3,10 @@ import assert from 'node:assert/strict';
 
 import { hexToBytes, normalizeBytesDeep } from '../dist/nodes/shared/params.js';
 import { PushCodes } from '../dist/nodes/shared/codes.js';
+import {
+	computeGroupTextPacketHash,
+	PAYLOAD_TYPE_GRP_TXT,
+} from '../dist/nodes/shared/channelHash.js';
 import { operations } from '../dist/nodes/MeshCore/operations.js';
 import { startMessageStream } from '../dist/nodes/MeshCoreTrigger/messageStream.js';
 import { startSubscriptions } from '../dist/nodes/MeshCoreTrigger/events.js';
@@ -307,29 +311,28 @@ test('startMessageStream emits both direct and channel when both selected', () =
 	]);
 });
 
-test('startMessageStream decodes packed pathLen into via/hops/pathHashSize', () => {
+test('startMessageStream decodes pathLen into via/hops (no hashSize — firmware does not include path bytes here)', () => {
 	const conn = new FakeConn({});
 	const events: Array<{ event: string; payload: any }> = [];
 	startMessageStream(conn as any, ['directMessage', 'channelMessage'], (event, payload) =>
 		events.push({ event, payload }),
 	);
 
-	// 0xFF sentinel → direct routing (no hops, no hash size)
 	conn.deliverMessage({ contactMessage: { text: 'd1', pathLen: 0xff } });
-	// pathLen=3 (low 6 bits) — 3 hops, 1-byte hashes
 	conn.deliverMessage({ contactMessage: { text: 'd2', pathLen: 3 } });
-	// pathLen=0x43 = 0b01000011 — 3 hops, 2-byte hashes (observed on live hw)
 	conn.deliverMessage({ channelMessage: { text: 'Bob: ch', pathLen: 0x43 } });
 
 	assert.equal(events[0].payload.via, 'direct');
 	assert.equal(events[0].payload.hops, 0);
-	assert.equal(events[0].payload.pathHashSize, undefined, 'no path-hash size on direct');
 	assert.equal(events[1].payload.via, 'flood');
 	assert.equal(events[1].payload.hops, 3);
-	assert.equal(events[1].payload.pathHashSize, 1);
 	assert.equal(events[2].payload.via, 'flood');
 	assert.equal(events[2].payload.hops, 3, 'low 6 bits of 0x43');
-	assert.equal(events[2].payload.pathHashSize, 2, 'high 2 bits of 0x43, plus 1');
+	// hashSize would be meaningless without the path bytes — firmware does not include them
+	for (const e of events) {
+		assert.equal(e.payload.pathHashSize, undefined);
+		assert.equal(e.payload.hashSize, undefined);
+	}
 });
 
 test('channelMessage splits "<nick>: <text>" into author, text, rawText', () => {
@@ -689,6 +692,120 @@ test('message:sendDirect (reliable, forceFlood) resets path up front and skips p
 	assert.equal(resets, 1, 'one reset up front, none between phases');
 });
 
+test('message:sendChannel (reliable) confirms delivery on first heard retransmission', async () => {
+	const channelSecret = Buffer.alloc(16);
+	for (let i = 0; i < 16; i++) channelSecret[i] = i * 7 + 1;
+	const advName = 'SelfNode';
+	const text = 'hello channel';
+	const channelIdx = 0;
+
+	let conn: FakeConn;
+	let capturedTimestamp: number | null = null;
+
+	const repeaterPublicKey = Uint8Array.from([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22, 0x33, 0x44]);
+	const otherContactKey = Uint8Array.from([0x55, 0x66, 0x77]);
+
+	const mesh = makeEmitterMesh();
+	mesh.getSelfInfo = async () => ({ name: advName });
+	mesh.getChannel = async () => ({ channelIdx, name: 'Public', secret: channelSecret });
+	// Used for relay-prefix resolution after a successful echo:
+	mesh.getContacts = async () => [
+		{ publicKey: otherContactKey, advName: 'Other', type: 1 },
+		{ publicKey: repeaterPublicKey, advName: 'HomeRelay', type: 2 },
+	];
+	mesh.sendCommandSendChannelTxtMsg = async (
+		_txtType: number,
+		_idx: number,
+		ts: number,
+		_text: string,
+	) => {
+		capturedTimestamp = ts;
+		// fire the device OK response, then simulate a neighbor retransmitting our packet.
+		// path byte = 0xaa = first byte of repeaterPublicKey (1-byte hashSize default).
+		setImmediate(() => mesh.emit(0, {})); // RESP_CODE_OK = 0
+		setImmediate(() => {
+			const { payload } = computeGroupTextPacketHash(channelSecret, advName, text, ts);
+			const header = (PAYLOAD_TYPE_GRP_TXT << 2) | 0x01;
+			const frame = Buffer.concat([Buffer.from([header, 0x01, 0xaa]), payload]);
+			conn.fire(0x88, { lastSnr: -3, lastRssi: -90, raw: frame });
+		});
+	};
+	conn = new FakeConn(mesh);
+
+	const r = (await operations['message:sendChannel'](
+		conn as any,
+		fakeCtx({
+			channelIdx,
+			message: text,
+			reliableDelivery: true,
+			channelRetries: 3,
+			channelEchoTimeoutMs: 500,
+		}),
+		0,
+	)) as any;
+
+	assert.ok(capturedTimestamp !== null, 'sendCommandSendChannelTxtMsg was invoked');
+	assert.equal(r.delivered, true);
+	assert.equal(r.attempts, 1, 'first attempt picked up the echo');
+	assert.equal(r.firstHeardSnr, -3);
+	assert.equal(r.firstHeardRssi, -90);
+	assert.equal(r.firstHeardHops, 1, 'one hop = direct neighbor heard');
+	assert.equal(r.firstHeardHashSize, 1, 'hashSize meaningful here — path bytes are exposed');
+	assert.equal(r.firstHeardPath, 'aa', 'full path on the wire (one byte = one 1-byte hop)');
+	assert.equal(r.firstRelayHashPrefix, 'aa', 'last path byte = neighbor pubKey prefix');
+	assert.equal(r.firstRelayCandidates.length, 1, 'one contact matches the 0xaa prefix');
+	assert.equal(r.firstRelayCandidates[0].name, 'HomeRelay');
+	assert.equal(r.firstRelayCandidates[0].type, 2);
+	assert.ok(r.firstRelayCandidates[0].publicKey.startsWith('aa'));
+	assert.ok(/^[0-9a-f]{16}$/.test(r.expectedPacketHash), 'returns the 8-byte expected hash as hex');
+});
+
+test('message:sendChannel (reliable) throws when no neighbor retransmits within retries', async () => {
+	const channelSecret = Buffer.alloc(16, 0xff);
+	let sends = 0;
+	const mesh = makeEmitterMesh();
+	mesh.getSelfInfo = async () => ({ name: 'A' });
+	mesh.getChannel = async () => ({ secret: channelSecret });
+	mesh.sendCommandSendChannelTxtMsg = async () => {
+		sends++;
+		setImmediate(() => mesh.emit(0, {})); // device ack ok, but no neighbor echo
+	};
+	const conn = new FakeConn(mesh);
+
+	await assert.rejects(
+		operations['message:sendChannel'](
+			conn as any,
+			fakeCtx({
+				channelIdx: 0,
+				message: 'into the void',
+				reliableDelivery: true,
+				channelRetries: 3,
+				channelEchoTimeoutMs: 20,
+			}),
+			0,
+		),
+		/not heard back after 3 attempt/,
+	);
+	assert.equal(sends, 3);
+});
+
+test('message:sendChannel (non-reliable) falls back to the high-level send and returns success', async () => {
+	let sent = false;
+	const mesh = {
+		sendChannelTextMessage: async (idx: number, text: string) => {
+			sent = idx === 1 && text === 'plain hi';
+		},
+	};
+	const conn = new FakeConn(mesh) as any;
+	const r = (await operations['message:sendChannel'](
+		conn,
+		fakeCtx({ channelIdx: 1, message: 'plain hi' }),
+		0,
+	)) as any;
+	assert.equal(sent, true);
+	assert.deepEqual(r, { success: true });
+});
+
 test('message:awaitDelivery matches by ackCode', async () => {
 	const conn = new FakeConn({});
 	const p = operations['message:awaitDelivery'](conn as any, fakeCtx({ ackCode: 222, ackTimeoutMs: 1000 }), 0);
@@ -752,6 +869,37 @@ test('diagnostics:awaitEvent waits for the chosen push code', async () => {
 	conn.fire(0x87, { statusData: 'x' });
 	const r = (await p) as any;
 	assert.equal(r.statusData, 'x');
+});
+
+test('startSubscriptions transforms newAdvert payload (decodes outPath + hops/hashSize)', async () => {
+	const conn = new FakeConn({ getWaitingMessages: async () => [] });
+	const caught: Array<{ event: string; payload: any }> = [];
+	const unsubs = startSubscriptions(conn as any, ['newAdvert'], (event, payload) =>
+		caught.push({ event, payload }),
+	);
+	const outPath = new Uint8Array(64);
+	for (let i = 0; i < 6; i++) outPath[i] = 0xa0 + i;
+	for (let i = 6; i < 64; i++) outPath[i] = 0xee; // would-be garbage
+	conn.fire(PushCodes.NewAdvert, {
+		publicKey: Uint8Array.from([1, 2, 3]),
+		type: 1,
+		flags: 0,
+		outPathLen: 0x43, // packed: 3 hops, 2-byte hashes → 6 real bytes
+		outPath,
+		advName: 'N',
+		lastAdvert: 0,
+		advLat: 0,
+		advLon: 0,
+		lastMod: 0,
+	});
+	assert.equal(caught.length, 1);
+	const p = caught[0].payload;
+	assert.equal(p.outPathHops, 3, 'decoded hops');
+	assert.equal(p.outPathHashSize, 2, 'decoded hash size');
+	// outPath is still a Buffer at the transform stage; trigger.emit normalizes it later.
+	assert.ok(p.outPath instanceof Uint8Array || Buffer.isBuffer(p.outPath));
+	assert.equal(p.outPath.length, 6, 'outPath truncated to hops*hashSize');
+	for (const unsubscribe of unsubs) unsubscribe();
 });
 
 test('startSubscriptions wires direct push events and unsubscribes', async () => {

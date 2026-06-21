@@ -34,12 +34,13 @@ export function parseChannelMessage(inner: IDataObject): IDataObject {
 
 /**
  * Firmware sets `pathLen=0xFF` on messages that were delivered along a known route
- * ("direct"). For flood-routed messages, `pathLen` is a PACKED byte (see firmware
- * `Packet.h::getPathHashCount/getPathHashSize`): low 6 bits are the hop count, high 2
- * bits are the path-hash size minus 1 (1..4 bytes per hop). Surface that as
- * `via` / `hops` / `pathHashSize` so workflows don't have to know either the sentinel
- * or the packing — and drop the raw `pathLen` byte from the output once decoded so
- * consumers don't see a useless 255 on direct messages.
+ * ("direct"). For flood-routed messages, `pathLen` is a PACKED byte (low 6 bits =
+ * hop count, high 2 bits = path-hash size - 1). Surface that as `via` / `hops` and
+ * drop the raw `pathLen` byte from the output (it would just be a useless 255 on
+ * direct messages). The hash size is intentionally NOT emitted here: the firmware
+ * does NOT include the actual path bytes in CONTACT_MSG_RECV / CHANNEL_MSG_RECV /
+ * CHANNEL_DATA_RECV frames, so a hash size with no path to apply it to would be
+ * misleading.
  */
 function withRoutingFields(inner: IDataObject): IDataObject {
 	const pathLen = Number(inner.pathLen);
@@ -51,12 +52,7 @@ function withRoutingFields(inner: IDataObject): IDataObject {
 	if (pathLen === 0xff) {
 		return { ...rest, via: 'direct', hops: 0 };
 	}
-	return {
-		...rest,
-		via: 'flood',
-		hops: pathLen & 0x3f,
-		pathHashSize: (pathLen >> 6) + 1,
-	};
+	return { ...rest, via: 'flood', hops: pathLen & 0x3f };
 }
 
 /** Emit a single drained message under its matching event, if that type is selected. */

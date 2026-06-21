@@ -2,6 +2,7 @@ import type { IDataObject, INodePropertyOptions } from 'n8n-workflow';
 
 import type { SharedConnection } from '../shared/ConnectionManager';
 import { PushCodes } from '../shared/codes';
+import { enrichContactRecord } from '../shared/contactPath';
 import { startMessageStream, type EmitFn } from './messageStream';
 
 /** Message sub-events served by draining MSG_WAITING (routed by message type). */
@@ -52,6 +53,19 @@ export const eventOptions: INodePropertyOptions[] = [
 ];
 
 /**
+ * Per-event payload transformers applied before emit. Use this to decode
+ * firmware-side encodings (e.g. packed `outPathLen`) so workflows see friendly
+ * fields. Events without an entry are emitted as-is.
+ */
+const eventTransforms: Record<string, (payload: IDataObject) => IDataObject> = {
+	// NewAdvert (0x8A) carries a full contact record (publicKey, type, flags,
+	// outPathLen, outPath, advName, lat/lon, …). Apply the same outPath decoding
+	// the action-side Get Many / Get by Key ops use so workflows don't see a
+	// 64-byte tail of garbage and have hops/hashSize at hand.
+	newAdvert: (payload) => enrichContactRecord({ ...payload }) as IDataObject,
+};
+
+/**
  * Wire up the selected events on the shared connection. Returns the unsubscribe
  * functions to call from the trigger's closeFunction.
  */
@@ -69,7 +83,13 @@ export function startSubscriptions(
 
 	for (const [event, code] of Object.entries(directPushEvents)) {
 		if (selectedEvents.includes(event)) {
-			unsubscribers.push(conn.subscribe(code, (payload) => emit(event, (payload ?? {}) as IDataObject)));
+			const transform = eventTransforms[event];
+			unsubscribers.push(
+				conn.subscribe(code, (payload) => {
+					const data = (payload ?? {}) as IDataObject;
+					emit(event, transform ? transform(data) : data);
+				}),
+			);
 		}
 	}
 

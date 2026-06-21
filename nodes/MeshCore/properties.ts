@@ -601,8 +601,37 @@ const fields: INodeProperties[] = [
 		type: 'boolean',
 		default: false,
 		description:
-			'Whether to send with delivery retries (path + flood phases) and wait for confirmation. On Send Direct Message, enabling this turns the node into a reliable-send: it throws on non-delivery (red status). On Send Direct Message and Await Reply, it also runs the retry+ack pipeline before listening for the reply.',
-		displayOptions: showFor('message', ['sendDirect', 'sendDirectAwaitReply']),
+			'Whether to send with delivery retries and confirmation. On Send Direct Message, enabling this turns the node into a reliable-send (path + flood retry phases, throws on non-delivery → red status). On Send Direct Message and Await Reply, it runs the same retry+ack pipeline before listening for the reply. On Send Channel Message, retries are confirmed by hearing a neighbor retransmit the broadcast on the radio (channels have no per-recipient ack); throws if no retransmission heard.',
+		displayOptions: showFor('message', ['sendDirect', 'sendDirectAwaitReply', 'sendChannel']),
+	},
+	{
+		displayName: 'Channel Retries',
+		name: 'channelRetries',
+		type: 'number',
+		default: 3,
+		description: 'How many times to broadcast the message before giving up',
+		displayOptions: {
+			show: {
+				resource: ['message'],
+				operation: ['sendChannel'],
+				reliableDelivery: [true],
+			},
+		},
+	},
+	{
+		displayName: 'Channel Echo Timeout (Ms)',
+		name: 'channelEchoTimeoutMs',
+		type: 'number',
+		default: 8000,
+		description:
+			'How long to wait per attempt for a neighbor to retransmit our broadcast (heard via the radio LogRxData stream) before retrying',
+		displayOptions: {
+			show: {
+				resource: ['message'],
+				operation: ['sendChannel'],
+				reliableDelivery: [true],
+			},
+		},
 	},
 	// Retry/timeout fields are shown when the operation supports them — either always
 	// (awaitDelivery needs ackTimeout) or gated on the Reliable Delivery toggle for

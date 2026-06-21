@@ -4,6 +4,14 @@ import { NodeOperationError } from 'n8n-workflow';
 import type { MeshConnection, SharedConnection } from '../shared/ConnectionManager';
 import { bytesToHex, hexToBytes, normalizeBytesDeep } from '../shared/params';
 import { PushCodes, ResponseCodes, TxtTypes } from '../shared/codes';
+import {
+	PAYLOAD_TYPE_GRP_TXT,
+	buffersEqual,
+	computeGroupTextPacketHash,
+	computePacketHash,
+	parseRxFrame,
+} from '../shared/channelHash';
+import { enrichContactRecord } from '../shared/contactPath';
 
 /**
  * One action-node operation. Reads its parameters from the execution context for the
@@ -61,46 +69,14 @@ function asObjectArray(value: unknown): IDataObject[] {
 }
 
 /**
- * Decode the firmware's packed `out_path_len` byte (same encoding as `pathLen` on
- * received messages, see `Packet::isValidPathLen`):
- *  - low 6 bits  = hop count
- *  - high 2 bits = path-hash bytes per hop, minus 1 (so values 1..4)
- *  - the special value `0xFF` (read as -1 via Int8) means `OUT_PATH_UNKNOWN` — no
- *    route stored, the firmware will fall back to flood routing.
- * Returns `null` for the unknown sentinel.
- */
-function decodeOutPath(
-	outPathLen: number,
-): { hops: number; hashSize: number; bytes: number } | null {
-	if (!Number.isFinite(outPathLen) || outPathLen < 0 || outPathLen === 0xff) {
-		return null;
-	}
-	const hops = outPathLen & 0x3f;
-	const hashSize = (outPathLen >> 6) + 1;
-	return { hops, hashSize, bytes: hops * hashSize };
-}
-
-/**
- * Normalize a contact for output:
- *  - decode the packed `outPathLen` and truncate the 64-byte `outPath` to the real
- *    byte length (`hops * hashSize`), so workflows don't see a tail of garbage zeros
- *    from the contact's uninitialized stack memory on the device.
- *  - add `outPathHops` and `outPathHashSize` so workflows can read them without
- *    re-decoding the packed byte.
- *  - emit empty `outPath` and `outPathHops: null` for the OUT_PATH_UNKNOWN sentinel.
+ * Normalize a contact for output (Get Many / Find / Get by Key). Decoding of
+ * `outPathLen` + `outPath` lives in `shared/contactPath.ts` because the trigger
+ * does the same enrichment for the NewAdvert push (which carries the same
+ * contact-record shape).
  */
 function contactJson(contact: unknown): IDataObject {
 	if (contact && typeof contact === 'object') {
-		const c = { ...(contact as Record<string, unknown>) };
-		const lenByte = Number(c.outPathLen);
-		const decoded = decodeOutPath(lenByte);
-		const path = c.outPath;
-		if (path instanceof Uint8Array || Array.isArray(path)) {
-			const bytes = decoded?.bytes ?? 0;
-			c.outPath = Buffer.from(path as Uint8Array).subarray(0, bytes);
-		}
-		c.outPathHops = decoded ? decoded.hops : null;
-		c.outPathHashSize = decoded ? decoded.hashSize : null;
+		const c = enrichContactRecord({ ...(contact as Record<string, unknown>) });
 		return asObject(c);
 	}
 	return asObject(contact);
@@ -309,6 +285,230 @@ async function sendTxtRaw(
 				});
 			}),
 	);
+}
+
+/**
+ * Send one CMD_SEND_CHANNEL_TXT_MSG frame with an explicit `senderTimestamp` (so
+ * retries share the same timestamp → same packet hash on air → repeaters dedupe
+ * and receivers don't surface duplicates) and wait for the device's RESP_CODE_OK.
+ */
+async function sendChannelTxtRaw(
+	conn: SharedConnection,
+	channelIdx: number,
+	senderTimestamp: number,
+	text: string,
+): Promise<void> {
+	return conn.run(
+		(c) =>
+			new Promise<void>((resolve, reject) => {
+				const off = () => {
+					c.off(ResponseCodes.Ok, onOk);
+					c.off(ResponseCodes.Err, onErr);
+				};
+				const onOk = () => {
+					off();
+					resolve();
+				};
+				const onErr = (response: unknown) => {
+					off();
+					const errCode = (response as { errCode?: unknown } | null)?.errCode;
+					reject(
+						new Error(
+							`MeshCore device returned ERR for SEND_CHANNEL_TXT_MSG${errCode != null ? ` (errCode=${String(errCode)})` : ''}`,
+						),
+					);
+				};
+				c.once(ResponseCodes.Ok, onOk);
+				c.once(ResponseCodes.Err, onErr);
+				const fn = (c as Record<string, unknown>).sendCommandSendChannelTxtMsg as
+					| ((t: number, ch: number, ts: number, txt: string) => Promise<void>)
+					| undefined;
+				if (typeof fn !== 'function') {
+					off();
+					reject(new Error('meshcore.js does not implement "sendCommandSendChannelTxtMsg"'));
+					return;
+				}
+				fn.call(c, TxtTypes.Plain, channelIdx, senderTimestamp, text).catch((e: unknown) => {
+					off();
+					reject(
+						e instanceof Error
+							? e
+							: new Error('sendCommandSendChannelTxtMsg failed: device returned an error or did not respond'),
+					);
+				});
+			}),
+	);
+}
+
+interface ReliableChannelOptions {
+	channelIdx: number;
+	text: string;
+	channelSecret: Buffer; // 16 bytes
+	advName: string;
+	retries: number;
+	perAttemptTimeoutMs: number;
+}
+
+interface HeardEcho {
+	snr: number;
+	rssi: number;
+	/** Hex of the LAST hop appended to the on-air path — that's our immediate
+	 * retransmitter's publicKey prefix (firmware appends `hashSize` bytes of its
+	 * own pubKey, see `Identity::copyHashTo`). May be empty if hops=0 (we heard
+	 * our own packet from someone who marked it do-not-retransmit, unusual). */
+	relayHashPrefixHex: string;
+	/** Full hex of the path field as it was on the wire — `hops * hashSize` bytes,
+	 * each chunk a 1..4-byte publicKey prefix of one repeater along the route. */
+	fullPathHex: string;
+	/** Total hops accumulated in the heard frame — usually 1 for a direct neighbor. */
+	hops: number;
+	hashSize: number;
+}
+
+interface ReliableChannelResult {
+	delivered: boolean;
+	attempts: number;
+	firstHeard: HeardEcho | null;
+	expectedHashHex: string;
+}
+
+/**
+ * Send a channel (broadcast) message reliably. The channel protocol has no
+ * per-recipient ACK, so "reliable" here means: at least one neighbor heard our
+ * broadcast and retransmitted it on the radio (the only signal of mesh propagation
+ * available to a single node). We compute the on-air packet hash locally and
+ * watch `PUSH_CODE_LOG_RX_DATA` for a frame whose hash matches.
+ *
+ * Retries reuse the SAME senderTimestamp + text → SAME packet hash → repeaters
+ * dedupe via their hashSeen table and receivers don't get duplicate UI entries
+ * (same idea as the direct-message retry path).
+ */
+async function reliableChannelSend(
+	conn: SharedConnection,
+	opts: ReliableChannelOptions,
+): Promise<ReliableChannelResult> {
+	const { channelIdx, text, channelSecret, advName, retries, perAttemptTimeoutMs } = opts;
+
+	const senderTimestamp = Math.floor(Date.now() / 1000);
+	const { hash: expectedHash } = computeGroupTextPacketHash(
+		channelSecret,
+		advName,
+		text,
+		senderTimestamp,
+	);
+
+	let heard: HeardEcho | null = null;
+	let pendingResolve: ((h: HeardEcho | null) => void) | null = null;
+
+	const unsubscribe = conn.subscribe(PushCodes.LogRxData, (raw) => {
+		if (heard !== null) return;
+		const frame = raw as { lastSnr?: number; lastRssi?: number; raw?: unknown };
+		const rawBytes =
+			frame.raw instanceof Uint8Array
+				? frame.raw
+				: Array.isArray(frame.raw)
+					? Uint8Array.from(frame.raw as number[])
+					: null;
+		if (!rawBytes) return;
+		const parsed = parseRxFrame(rawBytes);
+		if (!parsed || parsed.payloadType !== PAYLOAD_TYPE_GRP_TXT) return;
+		const hash = computePacketHash(PAYLOAD_TYPE_GRP_TXT, parsed.payload);
+		if (!buffersEqual(hash, expectedHash)) return;
+		// The LAST hop appended to the path is the most recent retransmitter — i.e.
+		// the neighbor we just heard. Each hop's bytes are a prefix of that node's
+		// publicKey (Identity::copyHashTo just memcpy's the first `hashSize` bytes).
+		const relayHash =
+			parsed.hops > 0
+				? parsed.path.subarray(parsed.path.length - parsed.hashSize)
+				: Buffer.alloc(0);
+		heard = {
+			snr: Number(frame.lastSnr ?? 0),
+			rssi: Number(frame.lastRssi ?? 0),
+			relayHashPrefixHex: relayHash.toString('hex'),
+			fullPathHex: parsed.path.toString('hex'),
+			hops: parsed.hops,
+			hashSize: parsed.hashSize,
+		};
+		if (pendingResolve) {
+			const r = pendingResolve;
+			pendingResolve = null;
+			r(heard);
+		}
+	});
+
+	const waitForEcho = (timeoutMs: number) =>
+		new Promise<HeardEcho | null>((resolve) => {
+			if (heard) {
+				resolve(heard);
+				return;
+			}
+			const timer = setTimeout(() => {
+				pendingResolve = null;
+				resolve(null);
+			}, timeoutMs);
+			pendingResolve = (h) => {
+				clearTimeout(timer);
+				resolve(h);
+			};
+		});
+
+	let attempts = 0;
+	try {
+		for (let i = 0; i < retries; i++) {
+			attempts++;
+			await sendChannelTxtRaw(conn, channelIdx, senderTimestamp, text);
+			const echo = await waitForEcho(perAttemptTimeoutMs);
+			if (echo) {
+				return {
+					delivered: true,
+					attempts,
+					firstHeard: echo,
+					expectedHashHex: expectedHash.toString('hex'),
+				};
+			}
+		}
+		return {
+			delivered: false,
+			attempts,
+			firstHeard: null,
+			expectedHashHex: expectedHash.toString('hex'),
+		};
+	} finally {
+		unsubscribe();
+	}
+}
+
+/**
+ * Try to resolve a path-hash prefix back to a known contact. Each repeater
+ * appends `hashSize` raw bytes of its own publicKey to the path; if any known
+ * contact's publicKey starts with the same bytes, it's a candidate. With the
+ * default 1-byte hashSize multiple contacts may collide, so we return ALL
+ * candidates rather than picking one — the workflow can decide.
+ */
+function resolveRelayCandidates(
+	contacts: unknown[],
+	relayHashPrefixHex: string,
+): Array<{ publicKey: string; name: string; type: number | null }> {
+	if (!relayHashPrefixHex) return [];
+	const out: Array<{ publicKey: string; name: string; type: number | null }> = [];
+	for (const c of contacts) {
+		if (!c || typeof c !== 'object') continue;
+		const rec = c as { publicKey?: unknown; advName?: unknown; type?: unknown };
+		const pk = rec.publicKey;
+		const pkHex =
+			pk instanceof Uint8Array
+				? Buffer.from(pk).toString('hex')
+				: typeof pk === 'string'
+					? pk.toLowerCase()
+					: null;
+		if (!pkHex || !pkHex.startsWith(relayHashPrefixHex.toLowerCase())) continue;
+		out.push({
+			publicKey: pkHex,
+			name: typeof rec.advName === 'string' ? rec.advName : '',
+			type: typeof rec.type === 'number' ? rec.type : null,
+		});
+	}
+	return out;
 }
 
 /**
@@ -662,8 +862,85 @@ export const operations: Record<string, OperationHandler> = {
 		return { ackCode, delivered: confirmed !== null, roundTrip: confirmed?.roundTrip ?? null };
 	},
 	'message:sendChannel': async (conn, ctx, i) => {
-		await call(conn, 'sendChannelTextMessage', num(ctx, 'channelIdx', i), str(ctx, 'message', i));
-		return OK;
+		const channelIdx = num(ctx, 'channelIdx', i);
+		const text = str(ctx, 'message', i);
+		const reliableDelivery = ctx.getNodeParameter('reliableDelivery', i, false) as boolean;
+
+		if (!reliableDelivery) {
+			await call(conn, 'sendChannelTextMessage', channelIdx, text);
+			return OK;
+		}
+
+		// Resolve our own advName (firmware embeds "<advName>: <text>" inside the
+		// group payload; we must match it byte-for-byte to compute the on-air hash)
+		// and the channel's 16-byte symmetric secret (AES key + HMAC material).
+		const self = (await call(conn, 'getSelfInfo', 10000)) as { name?: unknown };
+		const advName = String((self?.name as string) ?? '');
+		const channel = (await call(conn, 'getChannel', channelIdx)) as { secret?: unknown };
+		const secretBytes = channel?.secret;
+		if (!(secretBytes instanceof Uint8Array) && !Array.isArray(secretBytes)) {
+			throw new NodeOperationError(
+				ctx.getNode(),
+				`MeshCore channel ${channelIdx} has no secret available; cannot compute on-air packet hash for reliable send`,
+				{ itemIndex: i },
+			);
+		}
+		const channelSecret = Buffer.from(secretBytes as Uint8Array);
+
+		const retries = Math.max(1, Number(ctx.getNodeParameter('channelRetries', i, 3)));
+		const perAttemptTimeoutMs =
+			Number(ctx.getNodeParameter('channelEchoTimeoutMs', i, 8000)) || 8000;
+
+		const result = await reliableChannelSend(conn, {
+			channelIdx,
+			text,
+			channelSecret,
+			advName,
+			retries,
+			perAttemptTimeoutMs,
+		});
+
+		if (!result.delivered) {
+			throw new NodeOperationError(
+				ctx.getNode(),
+				`MeshCore channel broadcast not heard back after ${result.attempts} attempt(s)`,
+				{
+					itemIndex: i,
+					description: `No neighbor retransmission of expected packet hash ${result.expectedHashHex} was heard within ${perAttemptTimeoutMs}ms per attempt. The mesh may be empty in range, or no node is configured to repeat on this channel.`,
+				},
+			);
+		}
+
+		// Resolve the relay's pubkey-prefix against the contact list. Done lazily
+		// (only on success) so the happy path isn't paying for getContacts.
+		const heard = result.firstHeard!;
+		let relayCandidates: ReturnType<typeof resolveRelayCandidates> = [];
+		if (heard.relayHashPrefixHex) {
+			try {
+				const contacts = ((await call(conn, 'getContacts')) ?? []) as unknown[];
+				relayCandidates = resolveRelayCandidates(contacts, heard.relayHashPrefixHex);
+			} catch {
+				// non-fatal: still report the raw prefix below
+			}
+		}
+
+		return {
+			delivered: true,
+			attempts: result.attempts,
+			firstHeardSnr: heard.snr,
+			firstHeardRssi: heard.rssi,
+			firstHeardHops: heard.hops,
+			firstHeardHashSize: heard.hashSize,
+			// hex of the full on-air path: hops * hashSize bytes, each chunk a
+			// publicKey prefix of one repeater along the route we just heard.
+			firstHeardPath: heard.fullPathHex,
+			// raw bytes of the LAST hop only (the immediate retransmitter we heard)
+			firstRelayHashPrefix: heard.relayHashPrefixHex,
+			// resolved contact(s) — empty if unknown to us, multiple if the short
+			// hash prefix collides; ambiguous resolution is the workflow's call.
+			firstRelayCandidates: relayCandidates,
+			expectedPacketHash: result.expectedHashHex,
+		};
 	},
 	'message:sendDirectAwaitReply': async (conn, ctx, i) => {
 		const publicKey = hexToBytes(str(ctx, 'contactPublicKey', i));

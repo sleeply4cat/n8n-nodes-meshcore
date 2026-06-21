@@ -76,19 +76,56 @@ test('onFrameReceived parses CONTACT_DELETED push (0x8f)', async () => {
 	assert.deepEqual(payload, { publicKey: 'bb'.repeat(32) });
 });
 
-test('onFrameReceived parses CONTROL_DATA push (0x8e) with signed snr/rssi', async () => {
+test('onFrameReceived parses CONTROL_DATA push (0x8e) with signed snr/rssi + decoded hops (no hashSize — frame has no path bytes)', async () => {
 	const conn = new ExtendedTCPConnection('127.0.0.1', 5000);
 	let payload: any = null;
 	conn.on(0x8e, (p: unknown) => { payload = p; });
 
-	// snr=-4 (0xFC) -> -1.0 after /4 ; rssi=-50 (0xCE) ; pathLen=2 ; payload=de ad
-	conn.onFrameReceived(Uint8Array.from([0x8e, 0xfc, 0xce, 0x02, 0xde, 0xad]));
+	// snr=-4 (0xFC) -> -1.0 after /4 ; rssi=-50 (0xCE) ; pathLen=0x43 (packed: 3 hops, 2-byte hash) ; payload=de ad
+	conn.onFrameReceived(Uint8Array.from([0x8e, 0xfc, 0xce, 0x43, 0xde, 0xad]));
 	await tick();
 
 	assert.equal(payload.snr, -1);
 	assert.equal(payload.rssi, -50);
-	assert.equal(payload.pathLen, 2);
+	assert.equal(payload.pathLen, 0x43);
+	assert.equal(payload.hops, 3);
+	assert.equal(payload.hashSize, undefined, 'no path bytes in this frame → hashSize would be meaningless');
 	assert.equal(payload.payload, 'dead');
+});
+
+test('onFrameReceived parses ADVERT_PATH (22) honoring packed pathLen byte count', async () => {
+	const conn = new ExtendedTCPConnection('127.0.0.1', 5000);
+	let payload: any = null;
+	conn.on(22, (p: unknown) => { payload = p; });
+	// recvTimestamp = 0x11223344 LE ; pathLen = 0x43 (3 hops, 2-byte hash → 6 real bytes)
+	const ts = [0x44, 0x33, 0x22, 0x11];
+	const path = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+	conn.onFrameReceived(Uint8Array.from([22, ...ts, 0x43, ...path]));
+	await tick();
+	assert.equal(payload.recvTimestamp, 0x11223344);
+	assert.equal(payload.pathLen, 0x43);
+	assert.equal(payload.hops, 3);
+	assert.equal(payload.hashSize, 2);
+	assert.equal(payload.path, 'aabbccddeeff');
+});
+
+test('onFrameReceived parses PATH_DISCOVERY_RESPONSE (0x8d) with both packed path fields', async () => {
+	const conn = new ExtendedTCPConnection('127.0.0.1', 5000);
+	let payload: any = null;
+	conn.on(0x8d, (p: unknown) => { payload = p; });
+	const prefix = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+	// outPath: pathLen=0x02 (2 hops × 1 byte = 2 real bytes), inPath: pathLen=0x41 (1 hop × 2 bytes = 2 real bytes)
+	conn.onFrameReceived(
+		Uint8Array.from([0x8d, 0x00, ...prefix, 0x02, 0xaa, 0xbb, 0x41, 0xcc, 0xdd]),
+	);
+	await tick();
+	assert.equal(payload.pubKeyPrefix, '010203040506');
+	assert.equal(payload.outPath, 'aabb');
+	assert.equal(payload.outPathHops, 2);
+	assert.equal(payload.outPathHashSize, 1);
+	assert.equal(payload.inPath, 'ccdd');
+	assert.equal(payload.inPathHops, 1);
+	assert.equal(payload.inPathHashSize, 2);
 });
 
 test('onFrameReceived delegates unknown/base codes to the base class', async () => {

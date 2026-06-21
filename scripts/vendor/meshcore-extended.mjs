@@ -77,6 +77,26 @@ function readFixedString(reader, length) {
 	return Buffer.from(nul === -1 ? bytes : bytes.slice(0, nul)).toString('utf8');
 }
 
+/**
+ * Decode the firmware's packed `path_len` byte (low 6 bits = hop count, high 2 bits
+ * = bytes per hop minus 1). Returns the number of REAL path bytes that the firmware
+ * actually wrote via `mesh::Packet::writePath` (= hops * hashSize), plus the decoded
+ * hops and hashSize for downstream consumers.
+ */
+function decodePackedPathLen(byte) {
+	const hops = byte & 0x3f;
+	const hashSize = (byte >> 6) + 1;
+	return { hops, hashSize, bytes: hops * hashSize };
+}
+
+/** Read a packed-path-len byte + its REAL byte payload, returning {pathLen, hops, hashSize, path}. */
+function readPackedPath(reader) {
+	const pathLen = reader.readByte();
+	const { hops, hashSize, bytes } = decodePackedPathLen(pathLen);
+	const path = bytes > 0 ? toHex(reader.readBytes(bytes)) : '';
+	return { pathLen, hops, hashSize, path };
+}
+
 class ExtendedTCPConnection extends TCPConnection {
 	/**
 	 * Parse response/push codes the base class drops, then delegate everything else.
@@ -109,9 +129,12 @@ class ExtendedTCPConnection extends TCPConnection {
 			},
 			[RESP.ADVERT_PATH]: (r) => {
 				const recvTimestamp = r.readUInt32LE();
-				const pathLen = r.readByte();
-				const path = pathLen > 0 ? r.readBytes(pathLen) : [];
-				this.emit(RESP.ADVERT_PATH, { recvTimestamp, pathLen, path: toHex(path) });
+				// path_len is PACKED (low 6 bits = hop count, high 2 bits = bytes per hop - 1).
+				// Firmware writes `hops * hashSize` real bytes via Packet::writePath, not the
+				// raw byte; reading `pathLen` bytes as the previous code did over-reads (and
+				// breaks trailing-field parsing) whenever hashSize > 1.
+				const { pathLen, hops, hashSize, path } = readPackedPath(r);
+				this.emit(RESP.ADVERT_PATH, { recvTimestamp, pathLen, hops, hashSize, path });
 			},
 			[RESP.TUNING_PARAMS]: (r) => {
 				const rxDelayBase = r.readUInt32LE() / 1000;
@@ -143,18 +166,31 @@ class ExtendedTCPConnection extends TCPConnection {
 			[PUSH.PATH_DISCOVERY_RESPONSE]: (r) => {
 				r.readByte(); // reserved
 				const pubKeyPrefix = toHex(r.readBytes(6));
-				const outPathLen = r.readByte();
-				const outPath = toHex(outPathLen > 0 ? r.readBytes(outPathLen) : []);
-				const inPathLen = r.readByte();
-				const inPath = toHex(inPathLen > 0 ? r.readBytes(inPathLen) : []);
-				this.emit(PUSH.PATH_DISCOVERY_RESPONSE, { pubKeyPrefix, outPath, inPath });
+				// both out_path_len and in_path_len are PACKED (see readPackedPath note).
+				const out = readPackedPath(r);
+				const inp = readPackedPath(r);
+				this.emit(PUSH.PATH_DISCOVERY_RESPONSE, {
+					pubKeyPrefix,
+					outPath: out.path,
+					outPathLen: out.pathLen,
+					outPathHops: out.hops,
+					outPathHashSize: out.hashSize,
+					inPath: inp.path,
+					inPathLen: inp.pathLen,
+					inPathHops: inp.hops,
+					inPathHashSize: inp.hashSize,
+				});
 			},
 			[PUSH.CONTROL_DATA]: (r) => {
 				const snr = toInt8(r.readByte()) / 4;
 				const rssi = toInt8(r.readByte());
+				// path_len is packed (hops + hashSize), but only `hops` is meaningful here:
+				// the firmware does not include the path bytes in this frame, only the
+				// payload, so the hash size would be a number without a path to apply to.
 				const pathLen = r.readByte();
+				const { hops } = decodePackedPathLen(pathLen);
 				const payload = toHex(r.readRemainingBytes());
-				this.emit(PUSH.CONTROL_DATA, { snr, rssi, pathLen, payload });
+				this.emit(PUSH.CONTROL_DATA, { snr, rssi, pathLen, hops, payload });
 			},
 			[PUSH.CONTACT_DELETED]: (r) => {
 				this.emit(PUSH.CONTACT_DELETED, { publicKey: toHex(r.readBytes(PUB_KEY_SIZE)) });
