@@ -1,4 +1,15 @@
 /**
+ * The firmware's `OUT_PATH_UNKNOWN` sentinel (firmware `ContactInfo.h`): a packed
+ * path_len of `0xFF` means "no route stored". On a send command it selects
+ * flood(-scoped) routing; note that path_len `0` is NOT this — it is a valid
+ * zero-hop DIRECT path.
+ */
+export const OUT_PATH_UNKNOWN = 0xff;
+
+/** Max hops encodable in the low 6 bits of a packed path_len byte. */
+const MAX_PATH_HOPS = 0x3f;
+
+/**
  * Decode the firmware's packed `out_path_len` byte (used in contact records and in
  * the NewAdvert push). Low 6 bits = hop count, high 2 bits = path-hash bytes per
  * hop minus 1. The special value `0xFF` (read as -1 via Int8) means
@@ -13,6 +24,23 @@ export function decodeOutPathLen(
 	const hops = outPathLen & 0x3f;
 	const hashSize = (outPathLen >> 6) + 1;
 	return { hops, hashSize, bytes: hops * hashSize };
+}
+
+/**
+ * Encode a packed `path_len` byte — the inverse of decodeOutPathLen. Low 6 bits =
+ * hop count, high 2 bits = hashSize - 1. The firmware reserves hashSize 4
+ * (`Packet::isValidPathLen`), so only 1-3 are valid. Throws on an out-of-range hop
+ * count or hash size so a malformed route surfaces as an error rather than a
+ * silently truncated / mis-routed packet.
+ */
+export function encodePathLen(hops: number, hashSize = 1): number {
+	if (!Number.isInteger(hops) || hops < 0 || hops > MAX_PATH_HOPS) {
+		throw new Error(`Path has too many hops (${hops}); the maximum is ${MAX_PATH_HOPS}`);
+	}
+	if (!Number.isInteger(hashSize) || hashSize < 1 || hashSize > 3) {
+		throw new Error(`Invalid path hash size (${hashSize}); must be 1-3`);
+	}
+	return ((hashSize - 1) << 6) | hops;
 }
 
 /**

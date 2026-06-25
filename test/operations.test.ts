@@ -380,6 +380,35 @@ test('channel:set parses secret hex and forwards name + index', async () => {
 	assert.deepEqual(result, { success: true });
 });
 
+test('channel:sendData flood routing uses OUT_PATH_UNKNOWN (0xFF), not path_len 0', async () => {
+	let args: unknown[] = [];
+	const mesh = { sendChannelData: async (...a: unknown[]) => { args = a; } };
+	const conn = new FakeConn(mesh) as any;
+	const ctx = fakeCtx({ routing: 'flood', channelIdx: 1, dataType: 0xffff, payload: 'dead' });
+
+	const result = await operations['channel:sendData'](conn, ctx, 0);
+
+	assert.equal(args[0], 1); // channelIdx
+	assert.equal(args[1], 0xff); // pathLen = OUT_PATH_UNKNOWN → flood, NOT 0 (zero-hop direct)
+	assert.equal(Buffer.from(args[2] as Uint8Array).length, 0); // no path bytes
+	assert.equal(args[3], 0xffff); // dataType passed through
+	assert.equal(Buffer.from(args[4] as Uint8Array).toString('hex'), 'dead');
+	assert.deepEqual(result, { success: true });
+});
+
+test('channel:sendData direct routing packs path_len from the hop bytes', async () => {
+	let args: unknown[] = [];
+	const mesh = { sendChannelData: async (...a: unknown[]) => { args = a; } };
+	const conn = new FakeConn(mesh) as any;
+	const ctx = fakeCtx({ routing: 'direct', channelIdx: 0, path: '0102', dataType: 7, payload: 'ff' });
+
+	await operations['channel:sendData'](conn, ctx, 0);
+
+	assert.equal(args[1], 2); // 2 one-byte hops → packed path_len 2
+	assert.equal(Buffer.from(args[2] as Uint8Array).toString('hex'), '0102');
+	assert.equal(args[3], 7);
+});
+
 test('contact:findByName returns found:false when not found', async () => {
 	const mesh = { findContactByName: async () => undefined };
 	const conn = new FakeConn(mesh) as any;

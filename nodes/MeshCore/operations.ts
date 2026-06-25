@@ -11,7 +11,7 @@ import {
 	computePacketHash,
 	parseRxFrame,
 } from '../shared/channelHash';
-import { enrichContactRecord } from '../shared/contactPath';
+import { enrichContactRecord, encodePathLen, OUT_PATH_UNKNOWN } from '../shared/contactPath';
 
 /**
  * One action-node operation. Reads its parameters from the execution context for the
@@ -1033,9 +1033,23 @@ export const operations: Record<string, OperationHandler> = {
 		return channel ? asObject(channel) : { found: false };
 	},
 	'channel:sendData': async (conn, ctx, i) => {
-		const path = optionalHex(str(ctx, 'path', i));
 		const payload = hexToBytes(str(ctx, 'payload', i));
-		await call(conn, 'sendChannelData', num(ctx, 'channelIdx', i), path.length, path, num(ctx, 'dataType', i), payload);
+		const dataType = num(ctx, 'dataType', i);
+		let pathLen: number;
+		let path: Buffer;
+		if (str(ctx, 'routing', i) === 'direct') {
+			// Direct: route bytes are 1-byte-hash hops (one hex byte = one hop, per the
+			// Path field convention), so the packed path_len is just the hop count.
+			path = optionalHex(str(ctx, 'path', i));
+			pathLen = encodePathLen(path.length);
+		} else {
+			// Flood: the firmware needs OUT_PATH_UNKNOWN (0xFF), NOT path_len 0 — a 0 is a
+			// valid zero-hop DIRECT send (Packet::isValidPathLen). With no scope set the
+			// device floods plainly; otherwise it applies the current/default flood scope.
+			path = Buffer.alloc(0);
+			pathLen = OUT_PATH_UNKNOWN;
+		}
+		await call(conn, 'sendChannelData', num(ctx, 'channelIdx', i), pathLen, path, dataType, payload);
 		return OK;
 	},
 
