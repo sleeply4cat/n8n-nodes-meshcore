@@ -98,7 +98,7 @@ const operationSelectors: INodeProperties[] = [
 			{ name: 'Await Delivery', value: 'awaitDelivery', action: 'Await a delivery confirmation', description: 'Wait for the delivery confirmation (ack) of an already-sent message' },
 			{ name: 'Get Waiting Messages', value: 'getWaiting', action: 'Get waiting messages', description: 'Drain all messages queued on the device' },
 			{ name: 'Send Channel Message', value: 'sendChannel', action: 'Send a channel message', description: 'Send a text message to a channel' },
-			{ name: 'Send Channel Message as Name', value: 'sendChannelAs', action: 'Send a channel message as a name', description: 'Send a channel message under any sender name, by assembling the packet on the host (firmware v1.16.0+)' },
+			{ name: 'Send Channel Message With Custom Nickname', value: 'sendChannelWithNickname', action: 'Send a channel message with a custom nickname', description: 'Send a channel message under any nickname, by assembling the packet on the host (firmware v1.16.0+)' },
 			{ name: 'Send Direct Message', value: 'sendDirect', action: 'Send a direct message', description: 'Send a text message to a contact by public key; enable Reliable Delivery for retries + delivery confirmation' },
 			{ name: 'Send Direct Message and Await Reply', value: 'sendDirectAwaitReply', action: 'Send a direct message and await reply', description: 'Send a direct message and wait for the contact to reply' },
 			{ name: 'Sync Next Message', value: 'syncNext', action: 'Sync the next message', description: 'Fetch the next single queued message' },
@@ -274,7 +274,7 @@ const fields: INodeProperties[] = [
 		displayOptions: showFor('message', [
 			'sendDirect',
 			'sendChannel',
-			'sendChannelAs',
+			'sendChannelWithNickname',
 			'sendDirectAwaitReply',
 		]),
 	},
@@ -301,18 +301,18 @@ const fields: INodeProperties[] = [
 		description: 'Zero-based channel index',
 		displayOptions: showForAny(
 			['message', 'channel'],
-			['sendChannel', 'sendChannelAs', 'get', 'set', 'delete', 'sendData'],
+			['sendChannel', 'sendChannelWithNickname', 'get', 'set', 'delete', 'sendData'],
 		),
 	},
 	{
-		displayName: 'Sender Name',
-		name: 'senderName',
+		displayName: 'Nickname',
+		name: 'nickname',
 		type: 'string',
 		default: '',
 		required: true,
 		description:
-			'Author shown in the channel. The name is only a prefix inside the encrypted text, so anyone can claim any name — treat a channel message\'s author as unverified, both here and on receive.',
-		displayOptions: showFor('message', ['sendChannelAs']),
+			'Author shown in the channel. The nickname is only a prefix inside the encrypted text, so anyone can claim any nickname — treat a channel message\'s author as unverified, both here and on receive.',
+		displayOptions: showFor('message', ['sendChannelWithNickname']),
 	},
 	{
 		displayName: 'Priority',
@@ -321,7 +321,7 @@ const fields: INodeProperties[] = [
 		default: 0,
 		typeOptions: { minValue: 0, maxValue: 255 },
 		description: 'Outbound queue priority; lower goes out sooner',
-		displayOptions: showFor('message', ['sendChannelAs']),
+		displayOptions: showFor('message', ['sendChannelWithNickname']),
 	},
 	// channel secret (hex)
 	{
@@ -796,8 +796,13 @@ const fields: INodeProperties[] = [
 		type: 'boolean',
 		default: false,
 		description:
-			'Whether to send with delivery retries and confirmation. On Send Direct Message, enabling this turns the node into a reliable-send (path + flood retry phases, throws on non-delivery → red status). On Send Direct Message and Await Reply, it runs the same retry+ack pipeline before listening for the reply. On Send Channel Message, retries are confirmed by hearing a neighbor retransmit the broadcast on the radio (channels have no per-recipient ack); throws if no retransmission heard.',
-		displayOptions: showFor('message', ['sendDirect', 'sendDirectAwaitReply', 'sendChannel']),
+			'Whether to send with delivery retries and confirmation. On Send Direct Message, enabling this turns the node into a reliable-send (path + flood retry phases, throws on non-delivery → red status). On Send Direct Message and Await Reply, it runs the same retry+ack pipeline before listening for the reply. On Send Channel Message and Send Channel Message With Custom Nickname, retries are confirmed by hearing a neighbor retransmit the broadcast on the radio (channels have no per-recipient ack); throws if no retransmission heard.',
+		displayOptions: showFor('message', [
+			'sendDirect',
+			'sendDirectAwaitReply',
+			'sendChannel',
+			'sendChannelWithNickname',
+		]),
 	},
 	{
 		displayName: 'Channel Retries',
@@ -808,7 +813,7 @@ const fields: INodeProperties[] = [
 		displayOptions: {
 			show: {
 				resource: ['message'],
-				operation: ['sendChannel'],
+				operation: ['sendChannel', 'sendChannelWithNickname'],
 				reliableDelivery: [true],
 			},
 		},
@@ -823,7 +828,7 @@ const fields: INodeProperties[] = [
 		displayOptions: {
 			show: {
 				resource: ['message'],
-				operation: ['sendChannel'],
+				operation: ['sendChannel', 'sendChannelWithNickname'],
 				reliableDelivery: [true],
 			},
 		},

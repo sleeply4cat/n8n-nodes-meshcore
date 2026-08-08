@@ -46,7 +46,7 @@ connection to the device.
 |---|---|
 | **Device** | Get Self Info, Get Device Info, Get/Set Radio Parameters, Get Battery Voltage, Get/Set/Sync Device Time, Set Advert Name, Set Advert Lat/Long, Set TX Power, Get Stats, Reboot, Set Device Pin, Get/Set Custom Variable(s), Get/Set Tuning Parameters, Get Allowed Repeat Frequencies, Get/Set Auto Add Config, Set Path Hash Mode, Factory Reset |
 | **Contact** | Get Many, Get by Key, Get Advert Path, Find by Name, Find by Public Key Prefix, Add or Update, Set Path, Reset Path, Share, Export, Import, Remove |
-| **Message** | Send Direct Message (toggle: Reliable Delivery), Send Direct Message and Await Reply (toggle: Reliable Delivery), Send Channel Message, Send Channel Message as Name, Await Delivery, Get Waiting Messages, Sync Next Message |
+| **Message** | Send Direct Message (toggle: Reliable Delivery), Send Direct Message and Await Reply (toggle: Reliable Delivery), Send Channel Message (toggle: Reliable Delivery), Send Channel Message With Custom Nickname (toggle: Reliable Delivery), Await Delivery, Get Waiting Messages, Sync Next Message |
 | **Channel** | Get Channel, Get Many, Set, Delete, Send Data, Find by Name, Find by Secret |
 | **Advert** | Send Flood Advert, Send Zero-Hop Advert |
 | **Diagnostics** | Get Status, Get Telemetry, Get Neighbours, Trace Path, Send Binary Request, Send Path Discovery, Discover Path, Await Event, Send Raw Data, Send Raw Packet |
@@ -153,7 +153,7 @@ grounded in the firmware's command/response layouts.
 
 ### Sending as an arbitrary name
 
-*Message → Send Channel Message as Name* assembles the `GRP_TXT` packet on the host and
+*Message → Send Channel Message With Custom Nickname* assembles the `GRP_TXT` packet on the host and
 transmits it with `CMD_SEND_RAW_PACKET` (**firmware v1.16.0+ only**). It exists because the
 device writes the author from its own `_prefs.node_name`, so `CMD_SEND_CHANNEL_TXT_MSG`
 cannot carry a per-message name.

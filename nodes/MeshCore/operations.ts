@@ -375,10 +375,10 @@ async function sendChannelTxtRaw(
 }
 
 interface ReliableChannelOptions {
-	channelIdx: number;
-	text: string;
-	channelSecret: Buffer; // 16 bytes
-	advName: string;
+	/** On-air hash of the packet each attempt puts on the radio; retries must repeat it. */
+	expectedHash: Buffer;
+	/** Transmit one attempt. Must produce a packet hashing to `expectedHash` every time. */
+	send: () => Promise<void>;
 	retries: number;
 	perAttemptTimeoutMs: number;
 }
@@ -413,23 +413,20 @@ interface ReliableChannelResult {
  * available to a single node). We compute the on-air packet hash locally and
  * watch `PUSH_CODE_LOG_RX_DATA` for a frame whose hash matches.
  *
- * Retries reuse the SAME senderTimestamp + text → SAME packet hash → repeaters
+ * Retries must reuse the SAME senderTimestamp + text → SAME packet hash → repeaters
  * dedupe via their hashSeen table and receivers don't get duplicate UI entries
  * (same idea as the direct-message retry path).
+ *
+ * The transmit step is a callback so this works for both ways of putting a channel
+ * message on the air: the device's own `CMD_SEND_CHANNEL_TXT_MSG`, and a packet we
+ * assembled ourselves to carry a custom nickname. The echo is the same either way — the
+ * hash covers the payload, and neither the sender's identity nor the route is in it.
  */
 async function reliableChannelSend(
 	conn: SharedConnection,
 	opts: ReliableChannelOptions,
 ): Promise<ReliableChannelResult> {
-	const { channelIdx, text, channelSecret, advName, retries, perAttemptTimeoutMs } = opts;
-
-	const senderTimestamp = Math.floor(Date.now() / 1000);
-	const { hash: expectedHash } = computeGroupTextPacketHash(
-		channelSecret,
-		advName,
-		text,
-		senderTimestamp,
-	);
+	const { expectedHash, send, retries, perAttemptTimeoutMs } = opts;
 
 	let heard: HeardEcho | null = null;
 	let pendingResolve: ((h: HeardEcho | null) => void) | null = null;
@@ -490,7 +487,7 @@ async function reliableChannelSend(
 	try {
 		for (let i = 0; i < retries; i++) {
 			attempts++;
-			await sendChannelTxtRaw(conn, channelIdx, senderTimestamp, text);
+			await send();
 			const echo = await waitForEcho(perAttemptTimeoutMs);
 			if (echo) {
 				return {
@@ -968,11 +965,18 @@ export const operations: Record<string, OperationHandler> = {
 		const perAttemptTimeoutMs =
 			Number(ctx.getNodeParameter('channelEchoTimeoutMs', i, 8000)) || 8000;
 
-		const result = await reliableChannelSend(conn, {
-			channelIdx,
-			text,
+		// Same timestamp on every attempt, so every attempt hashes the same and the mesh
+		// dedupes the retries instead of showing them twice.
+		const senderTimestamp = Math.floor(Date.now() / 1000);
+		const { hash: expectedHash } = computeGroupTextPacketHash(
 			channelSecret,
 			advName,
+			text,
+			senderTimestamp,
+		);
+		const result = await reliableChannelSend(conn, {
+			expectedHash,
+			send: () => sendChannelTxtRaw(conn, channelIdx, senderTimestamp, text),
 			retries,
 			perAttemptTimeoutMs,
 		});
@@ -1076,11 +1080,11 @@ export const operations: Record<string, OperationHandler> = {
 			watcher.cancel();
 		}
 	},
-	'message:sendChannelAs': async (conn, ctx, i) => {
+	'message:sendChannelWithNickname': async (conn, ctx, i) => {
 		const channelIdx = num(ctx, 'channelIdx', i);
-		const senderName = str(ctx, 'senderName', i);
-		if (!senderName.trim()) {
-			throw new Error('Sender Name is required — it becomes the author shown in the channel');
+		const nickname = str(ctx, 'nickname', i);
+		if (!nickname.trim()) {
+			throw new Error('Nickname is required — it becomes the author shown in the channel');
 		}
 		// The secret is read from the device, used to build the packet, and dropped — it is
 		// deliberately never part of the node's output.
@@ -1097,22 +1101,75 @@ export const operations: Record<string, OperationHandler> = {
 		const info = asObject(await call(conn, 'deviceQuery'));
 		const hashSize = Number(info.pathHashSize) || 1;
 
+		// One timestamp for every attempt: retries must hash identically or the mesh shows
+		// them as separate messages instead of deduping them.
 		const { frame, hash, truncated } = buildGroupTextPacket(
 			secret,
-			senderName,
+			nickname,
 			str(ctx, 'message', i),
 			Math.floor(Date.now() / 1000),
 			hashSize,
 		);
-		await call(conn, 'sendRawPacket', frame, num(ctx, 'priority', i));
-		return {
-			success: true,
+		const priority = num(ctx, 'priority', i);
+		const sent: IDataObject = {
 			channelIdx,
-			senderName,
+			nickname,
 			pathHashSize: hashSize,
 			packetHash: bytesToHex(hash),
 			packetBytes: frame.length,
 			truncated,
+		};
+
+		if (!(ctx.getNodeParameter('reliableDelivery', i, false) as boolean)) {
+			await call(conn, 'sendRawPacket', frame, priority);
+			return { success: true, ...sent };
+		}
+
+		const retries = Math.max(1, Number(ctx.getNodeParameter('channelRetries', i, 3)));
+		const perAttemptTimeoutMs =
+			Number(ctx.getNodeParameter('channelEchoTimeoutMs', i, 8000)) || 8000;
+		const result = await reliableChannelSend(conn, {
+			expectedHash: hash,
+			send: async () => {
+				await call(conn, 'sendRawPacket', frame, priority);
+			},
+			retries,
+			perAttemptTimeoutMs,
+		});
+
+		if (!result.delivered) {
+			throw new NodeOperationError(
+				ctx.getNode(),
+				`MeshCore channel broadcast not heard back after ${result.attempts} attempt(s)`,
+				{
+					itemIndex: i,
+					description: `No neighbor retransmission of expected packet hash ${result.expectedHashHex} was heard within ${perAttemptTimeoutMs}ms per attempt. The mesh may be empty in range, or no node is configured to repeat on this channel.`,
+				},
+			);
+		}
+
+		const heard = result.firstHeard!;
+		let relayCandidates: ReturnType<typeof resolveRelayCandidates> = [];
+		if (heard.relayHashPrefixHex) {
+			try {
+				const contacts = ((await call(conn, 'getContacts')) ?? []) as unknown[];
+				relayCandidates = resolveRelayCandidates(contacts, heard.relayHashPrefixHex);
+			} catch {
+				// non-fatal: the raw prefix is still reported below
+			}
+		}
+		return {
+			success: true,
+			delivered: true,
+			attempts: result.attempts,
+			...sent,
+			firstHeardSnr: heard.snr,
+			firstHeardRssi: heard.rssi,
+			firstHeardHops: heard.hops,
+			firstHeardHashSize: heard.hashSize,
+			firstHeardPath: heard.fullPathHex,
+			firstRelayHashPrefix: heard.relayHashPrefixHex,
+			firstRelayCandidates: relayCandidates,
 		};
 	},
 	'message:getWaiting': async (conn) => asObjectArray(await call(conn, 'getWaitingMessages')),
