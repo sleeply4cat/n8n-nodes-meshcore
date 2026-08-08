@@ -7,6 +7,7 @@ import { PushCodes, ResponseCodes, TxtTypes } from '../shared/codes';
 import {
 	PAYLOAD_TYPE_GRP_TXT,
 	buffersEqual,
+	buildGroupTextPacket,
 	computeGroupTextPacketHash,
 	computePacketHash,
 	parseRxFrame,
@@ -30,6 +31,16 @@ export type OperationHandler = (
  * not implement it (the coverage gaps that need a protocol extension — see CLAUDE.md §8).
  */
 function call<T = unknown>(conn: SharedConnection, method: string, ...args: unknown[]): Promise<T> {
+	return callWithTimeout<T>(conn, method, undefined, ...args);
+}
+
+/** `call`, with an explicit ceiling for commands that wait on the air inside meshcore.js. */
+function callWithTimeout<T = unknown>(
+	conn: SharedConnection,
+	method: string,
+	timeoutMs: number | undefined,
+	...args: unknown[]
+): Promise<T> {
 	return conn
 		.run((c: MeshConnection) => {
 			const fn = (c as Record<string, unknown>)[method];
@@ -37,7 +48,7 @@ function call<T = unknown>(conn: SharedConnection, method: string, ...args: unkn
 				throw new Error(`meshcore.js does not implement "${method}" (needs a protocol extension)`);
 			}
 			return (fn as (...a: unknown[]) => Promise<T>).apply(c, args);
-		})
+		}, timeoutMs)
 		.catch((error: unknown) => {
 			// meshcore.js rejects with `undefined` on a device ERR response; turn that
 			// (and any non-Error rejection) into an actionable message for the user.
@@ -85,10 +96,33 @@ function contactJson(contact: unknown): IDataObject {
 /** Result for fire-and-confirm commands that resolve with no payload (OK response). */
 const OK: IDataObject = { success: true };
 
+/**
+ * Queue ceiling for `tracePath` before the user's extra timeout is added. The command's
+ * own budget is the device's airtime estimate plus that extra, so this only has to cover
+ * the estimate; it exists so the queue never times out ahead of the trace's own, specific
+ * error message.
+ */
+const TRACE_COMMAND_CEILING_MS = 30000;
+
 const str = (ctx: IExecuteFunctions, name: string, i: number): string =>
 	ctx.getNodeParameter(name, i) as string;
 const num = (ctx: IExecuteFunctions, name: string, i: number): number =>
 	Number(ctx.getNodeParameter(name, i));
+
+/** Reject an out-of-range setting up front, naming the field as the UI labels it. */
+function assertInRange(label: string, value: number, min: number, max: number): void {
+	if (!Number.isFinite(value) || value < min || value > max) {
+		throw new Error(`${label} must be between ${min} and ${max} (got ${value})`);
+	}
+}
+
+/**
+ * The firmware writes signed byte fields (e.g. tx_power_dbm, which goes down to -9) into
+ * an unsigned frame byte, and meshcore.js reads them back unsigned.
+ */
+function toSignedByte(value: number): number {
+	return value > 127 ? value - 256 : value;
+}
 
 /**
  * Arm a reply watcher BEFORE sending, then call `wait(timeoutMs)` to bound how long to
@@ -684,6 +718,49 @@ export const operations: Record<string, OperationHandler> = {
 		await call(conn, 'setTxPower', num(ctx, 'txPower', i));
 		return OK;
 	},
+	'device:getDeviceInfo': async (conn) => asObject(await call(conn, 'deviceQuery')),
+	'device:getRadioParams': async (conn) => {
+		// The radio config only comes back on the AppStart handshake, inside SELF_INFO.
+		const info = asObject(await call(conn, 'getSelfInfo', 10000));
+		return {
+			frequencyMhz: Number(info.radioFreq) / 1000, // wire is kHz
+			bandwidthKhz: Number(info.radioBw) / 1000, // wire is Hz
+			spreadingFactor: Number(info.radioSf),
+			codingRate: Number(info.radioCr),
+			txPowerDbm: toSignedByte(Number(info.txPower)),
+			maxTxPowerDbm: Number(info.maxTxPower),
+		};
+	},
+	'device:setRadioParams': async (conn, ctx, i) => {
+		const frequencyMhz = num(ctx, 'frequencyMhz', i);
+		const bandwidthKhz = num(ctx, 'bandwidthKhz', i);
+		const spreadingFactor = num(ctx, 'spreadingFactor', i);
+		const codingRate = num(ctx, 'codingRate', i);
+		const clientRepeat = ctx.getNodeParameter('clientRepeat', i, false) as boolean;
+
+		// Firmware units and limits (MyMesh.cpp, CMD_SET_RADIO_PARAMS): freq in kHz,
+		// bandwidth in Hz. Range-check here so a typo is an explanatory message rather
+		// than a bare ERR_CODE_ILLEGAL_ARG from the device.
+		const freqKhz = Math.round(frequencyMhz * 1000);
+		const bandwidthHz = Math.round(bandwidthKhz * 1000);
+		assertInRange('Frequency (MHz)', frequencyMhz, 150, 2500);
+		assertInRange('Bandwidth (kHz)', bandwidthKhz, 7, 500);
+		assertInRange('Spreading Factor', spreadingFactor, 5, 12);
+		assertInRange('Coding Rate', codingRate, 5, 8);
+
+		await call(conn, 'setRadioParams', freqKhz, bandwidthHz, spreadingFactor, codingRate, clientRepeat);
+		return OK;
+	},
+	'device:setTuningParams': async (conn, ctx, i) => {
+		const rxDelayBase = num(ctx, 'rxDelayBase', i);
+		const airtimeFactor = num(ctx, 'airtimeFactor', i);
+		// the firmware clamps to these silently; reject instead, so the stored value is
+		// never quietly different from what the workflow asked for
+		assertInRange('RX Delay Base', rxDelayBase, 0, 20);
+		assertInRange('Airtime Factor', airtimeFactor, 0, 9);
+		await call(conn, 'setTuningParams', rxDelayBase, airtimeFactor);
+		return OK;
+	},
 	'device:reboot': async (conn) => {
 		await call(conn, 'reboot');
 		return OK;
@@ -999,6 +1076,45 @@ export const operations: Record<string, OperationHandler> = {
 			watcher.cancel();
 		}
 	},
+	'message:sendChannelAs': async (conn, ctx, i) => {
+		const channelIdx = num(ctx, 'channelIdx', i);
+		const senderName = str(ctx, 'senderName', i);
+		if (!senderName.trim()) {
+			throw new Error('Sender Name is required — it becomes the author shown in the channel');
+		}
+		// The secret is read from the device, used to build the packet, and dropped — it is
+		// deliberately never part of the node's output.
+		const channel = await call<{ secret?: Uint8Array }>(conn, 'getChannel', channelIdx);
+		const secret = Buffer.from(channel?.secret ?? []);
+		if (secret.length < 16) {
+			throw new Error(
+				`Channel ${channelIdx} returned no usable secret (${secret.length} bytes) — is that slot configured?`,
+			);
+		}
+		// Every repeater sizes the hash it appends by the packed path-length byte we set
+		// here, so it has to match the mesh's own path-hash mode — the device uses
+		// `path_hash_mode + 1` for its channel sends.
+		const info = asObject(await call(conn, 'deviceQuery'));
+		const hashSize = Number(info.pathHashSize) || 1;
+
+		const { frame, hash, truncated } = buildGroupTextPacket(
+			secret,
+			senderName,
+			str(ctx, 'message', i),
+			Math.floor(Date.now() / 1000),
+			hashSize,
+		);
+		await call(conn, 'sendRawPacket', frame, num(ctx, 'priority', i));
+		return {
+			success: true,
+			channelIdx,
+			senderName,
+			pathHashSize: hashSize,
+			packetHash: bytesToHex(hash),
+			packetBytes: frame.length,
+			truncated,
+		};
+	},
 	'message:getWaiting': async (conn) => asObjectArray(await call(conn, 'getWaitingMessages')),
 	'message:syncNext': async (conn) => {
 		const message = await call(conn, 'syncNextMessage');
@@ -1068,8 +1184,39 @@ export const operations: Record<string, OperationHandler> = {
 		asObject(await call(conn, 'getStatus', hexToBytes(str(ctx, 'contactPublicKey', i)))),
 	'diagnostics:getTelemetry': async (conn, ctx, i) =>
 		asObject(await call(conn, 'getTelemetry', hexToBytes(str(ctx, 'contactPublicKey', i)))),
-	'diagnostics:tracePath': async (conn, ctx, i) =>
-		asObject(await call(conn, 'tracePath', optionalHex(str(ctx, 'path', i)), num(ctx, 'extraTimeoutMs', i))),
+	'diagnostics:tracePath': async (conn, ctx, i) => {
+		const extraTimeoutMs = num(ctx, 'extraTimeoutMs', i);
+		// 0 = auto: ask the device for its path-hash mode. A route whose hop size does not
+		// match the mesh is transmitted happily and simply never answered.
+		let hashSize = Number(ctx.getNodeParameter('pathHashSize', i, 0));
+		if (!hashSize) {
+			const info = asObject(await call(conn, 'deviceQuery'));
+			hashSize = Number(info.pathHashSize) || 1;
+			// The mesh's path-hash mode allows 1, 2 or 3 bytes per hop, but a trace encodes
+			// the size as a shift in its flags byte (1 << path_sz), so 3 has no encoding.
+			if (hashSize === 3) {
+				throw new Error(
+					'This mesh uses 3-byte path hashes (path hash mode 2), which the trace ' +
+						'command cannot express — its flags field encodes the hop size as a power of ' +
+						'two. Set Path Hash Size explicitly to 2 or 4 and give the route in hops of ' +
+						'that width.',
+				);
+			}
+		}
+		// tracePath waits for the reply from inside meshcore.js, for the device's own
+		// airtime estimate plus this extra. Lift the queue's ceiling by the same extra so
+		// raising it in the UI can never be swallowed by the generic command timeout.
+		return asObject(
+			await callWithTimeout(
+				conn,
+				'tracePath',
+				TRACE_COMMAND_CEILING_MS + extraTimeoutMs,
+				optionalHex(str(ctx, 'path', i)),
+				extraTimeoutMs,
+				hashSize,
+			),
+		);
+	},
 	'diagnostics:getNeighbours': async (conn, ctx, i) =>
 		asObject(
 			await call(
@@ -1091,6 +1238,30 @@ export const operations: Record<string, OperationHandler> = {
 			num(ctx, 'extraTimeoutMs', i),
 		);
 		return { responseData: bytesToHex(responseData) };
+	},
+	'diagnostics:sendRawPacket': async (conn, ctx, i) => {
+		await call(conn, 'sendRawPacket', hexToBytes(str(ctx, 'rawPacket', i)), num(ctx, 'priority', i));
+		return OK;
+	},
+	'diagnostics:sendRawData': async (conn, ctx, i) => {
+		const path = optionalHex(str(ctx, 'path', i));
+		if (path.length > 0) {
+			// The firmware reads this command's path-length byte both as a byte count and as
+			// the packed count/size byte; those only agree with 1-byte hashes. Refuse rather
+			// than emit a packet that routes somewhere nobody asked for.
+			const info = asObject(await call(conn, 'deviceQuery'));
+			const hashSize = Number(info.pathHashSize) || 1;
+			if (hashSize > 1) {
+				throw new Error(
+					`Send Raw Data cannot use a path on this mesh: it uses ${hashSize}-byte path ` +
+						'hashes, and the firmware parses this command\'s path length inconsistently for ' +
+						'anything but 1-byte hashes. Leave Path empty to send zero-hop, or use Send Raw ' +
+						'Packet, which carries its own correctly packed path length.',
+				);
+			}
+		}
+		await call(conn, 'sendRawData', path, hexToBytes(str(ctx, 'rawData', i)));
+		return OK;
 	},
 	'diagnostics:sendPathDiscovery': async (conn, ctx, i) =>
 		asObject(await call(conn, 'sendPathDiscoveryReq', hexToBytes(str(ctx, 'contactPublicKey', i)))),

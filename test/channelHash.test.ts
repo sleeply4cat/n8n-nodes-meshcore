@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import { createCipheriv, createHash, createHmac } from 'node:crypto';
 
 import {
+	MAX_TEXT_LEN,
 	PAYLOAD_TYPE_GRP_TXT,
 	buffersEqual,
+	buildGroupTextPacket,
 	composeGroupTextPlaintext,
 	computeGroupTextPacketHash,
 	computePacketHash,
@@ -123,4 +125,73 @@ test('round trip: compose a frame from a known hash, parse + match', () => {
 	assert.ok(parsed);
 	const computed = computePacketHash(parsed!.payloadType, parsed!.payload);
 	assert.ok(buffersEqual(computed, hash), 'hash unchanged by appended path on retransmission');
+});
+
+test('buildGroupTextPacket produces a flood GRP_TXT frame that parses back to its payload', () => {
+	const { frame, hash, truncated } = buildGroupTextPacket(SECRET_PUBLIC, 'BotName', 'hello', 1000);
+
+	assert.equal(truncated, false);
+	assert.equal(frame[0] & 0x03, 1, 'route type is flood');
+	assert.equal((frame[0] >> 2) & 0x0f, PAYLOAD_TYPE_GRP_TXT, 'payload type is GRP_TXT');
+	assert.equal(frame[1], 0, 'packed path length is zero hops');
+
+	const parsed = parseRxFrame(frame);
+	assert.ok(parsed);
+	assert.equal(parsed!.payloadType, PAYLOAD_TYPE_GRP_TXT);
+	assert.ok(
+		buffersEqual(computePacketHash(parsed!.payloadType, parsed!.payload), hash),
+		'the returned hash is the on-air dedup key for this very frame',
+	);
+});
+
+test('buildGroupTextPacket payload matches what the hash pipeline already produced', () => {
+	// The send path must be byte-identical to the pipeline that was validated on hardware
+	// by matching neighbour retransmissions — otherwise the packet would not decrypt.
+	const { payload } = computeGroupTextPacketHash(SECRET_PUBLIC, 'BotName', 'hello', 1000);
+	const { frame } = buildGroupTextPacket(SECRET_PUBLIC, 'BotName', 'hello', 1000);
+	assert.equal(frame.subarray(2).toString('hex'), payload.toString('hex'));
+});
+
+test('buildGroupTextPacket truncates the text, not the name, to the firmware limit', () => {
+	const name = 'Bot';
+	const budget = MAX_TEXT_LEN - Buffer.byteLength(`${name}: `, 'utf8');
+	const { truncated } = buildGroupTextPacket(SECRET_PUBLIC, name, 'x'.repeat(budget + 20), 1000);
+	assert.equal(truncated, true);
+
+	const expected = computeGroupTextPacketHash(SECRET_PUBLIC, name, 'x'.repeat(budget), 1000);
+	const { frame } = buildGroupTextPacket(SECRET_PUBLIC, name, 'x'.repeat(budget + 20), 1000);
+	assert.equal(frame.subarray(2).toString('hex'), expected.payload.toString('hex'));
+
+	const short = buildGroupTextPacket(SECRET_PUBLIC, name, 'x'.repeat(budget), 1000);
+	assert.equal(short.truncated, false);
+});
+
+test('buildGroupTextPacket rejects a sender name that leaves no room for text', () => {
+	assert.throws(
+		() => buildGroupTextPacket(SECRET_PUBLIC, 'n'.repeat(MAX_TEXT_LEN), 'hi', 1000),
+		/Sender name is too long/,
+	);
+});
+
+test('buildGroupTextPacket encodes the hop hash size in the packed path-length byte', () => {
+	for (const [size, expected] of [[1, 0x00], [2, 0x40], [3, 0x80]] as const) {
+		const { frame } = buildGroupTextPacket(SECRET_PUBLIC, 'Bot', 'hi', 1000, size);
+		assert.equal(frame[1], expected, `hash size ${size} packs to 0x${expected.toString(16)}`);
+		const parsed = parseRxFrame(frame);
+		assert.equal(parsed!.hashSize, size, 'the byte reads back as the size we asked for');
+		assert.equal(parsed!.hops, 0, 'still zero hops');
+	}
+});
+
+test('buildGroupTextPacket rejects a hash size the packed byte cannot carry', () => {
+	// 4 would encode as path mode 3, which tryParsePacket refuses as reserved
+	assert.throws(() => buildGroupTextPacket(SECRET_PUBLIC, 'Bot', 'hi', 1000, 4), /must be 1, 2 or 3/);
+	assert.throws(() => buildGroupTextPacket(SECRET_PUBLIC, 'Bot', 'hi', 1000, 0), /must be 1, 2 or 3/);
+});
+
+test('the hop hash size does not disturb the encrypted payload', () => {
+	const a = buildGroupTextPacket(SECRET_PUBLIC, 'Bot', 'hi', 1000, 1);
+	const b = buildGroupTextPacket(SECRET_PUBLIC, 'Bot', 'hi', 1000, 2);
+	assert.equal(a.frame.subarray(2).toString('hex'), b.frame.subarray(2).toString('hex'));
+	assert.ok(buffersEqual(a.hash, b.hash), 'the dedup hash covers the payload, not the path byte');
 });

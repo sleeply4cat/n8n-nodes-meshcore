@@ -44,12 +44,12 @@ connection to the device.
 
 | Resource | Operations |
 |---|---|
-| **Device** | Get Self Info, Get Battery Voltage, Get/Set/Sync Device Time, Set Advert Name, Set Advert Lat/Long, Set TX Power, Get Stats, Reboot, Set Device Pin, Get/Set Custom Variable(s), Get Tuning Parameters, Get Allowed Repeat Frequencies, Get/Set Auto Add Config, Set Path Hash Mode, Factory Reset |
+| **Device** | Get Self Info, Get Device Info, Get/Set Radio Parameters, Get Battery Voltage, Get/Set/Sync Device Time, Set Advert Name, Set Advert Lat/Long, Set TX Power, Get Stats, Reboot, Set Device Pin, Get/Set Custom Variable(s), Get/Set Tuning Parameters, Get Allowed Repeat Frequencies, Get/Set Auto Add Config, Set Path Hash Mode, Factory Reset |
 | **Contact** | Get Many, Get by Key, Get Advert Path, Find by Name, Find by Public Key Prefix, Add or Update, Set Path, Reset Path, Share, Export, Import, Remove |
-| **Message** | Send Direct Message (toggle: Reliable Delivery), Send Direct Message and Await Reply (toggle: Reliable Delivery), Send Channel Message, Await Delivery, Get Waiting Messages, Sync Next Message |
+| **Message** | Send Direct Message (toggle: Reliable Delivery), Send Direct Message and Await Reply (toggle: Reliable Delivery), Send Channel Message, Send Channel Message as Name, Await Delivery, Get Waiting Messages, Sync Next Message |
 | **Channel** | Get Channel, Get Many, Set, Delete, Send Data, Find by Name, Find by Secret |
 | **Advert** | Send Flood Advert, Send Zero-Hop Advert |
-| **Diagnostics** | Get Status, Get Telemetry, Get Neighbours, Trace Path, Send Binary Request, Send Path Discovery, Discover Path, Await Event |
+| **Diagnostics** | Get Status, Get Telemetry, Get Neighbours, Trace Path, Send Binary Request, Send Path Discovery, Discover Path, Await Event, Send Raw Data, Send Raw Packet |
 | **Repeater** | Login, Logout, Has Connection, Sign Data, Send CLI Command, Send Anonymous Request, Send Control Data |
 | **Flood Scope** | Set Scope, Clear Scope, Get Default, Set Default |
 
@@ -145,8 +145,28 @@ has no runtime dependencies and pulls in no native `serialport`. Commands missin
 grounded in the firmware's command/response layouts.
 
 > ⚠️ The extended ("gap") commands and their response parsing were verified against the
-> MeshCore firmware source (`MyMesh.cpp`), **not yet against a live device**. Validate
-> them on real hardware before relying on them (see the checklist below).
+> MeshCore firmware source (`MyMesh.cpp`) and then exercised on real hardware (Heltec CT62,
+> firmware v1.14.1 and v1.16.0). These remain source-verified only, because the firmware is
+> too old or the state is hard to provoke: *Set/Get Default Flood Scope* (opcodes 63/64),
+> `LoginFail` (0x86), `ContactDeleted` / `ContactsFull` (0x8F / 0x90), *Set Radio
+> Parameters* and *Send Raw Data*.
+
+### Sending as an arbitrary name
+
+*Message → Send Channel Message as Name* assembles the `GRP_TXT` packet on the host and
+transmits it with `CMD_SEND_RAW_PACKET` (**firmware v1.16.0+ only**). It exists because the
+device writes the author from its own `_prefs.node_name`, so `CMD_SEND_CHANNEL_TXT_MSG`
+cannot carry a per-message name.
+
+The crypto is `nodes/shared/channelHash.ts`, the same pipeline whose packet hashes are
+already matched against real retransmissions by the reliable-channel-send path — the packet
+builder only adds the header and the packed path-length byte. That byte's hash size is read
+from the device (`path_hash_mode + 1`), because every repeater sizes the hash it appends by
+it.
+
+A channel message's author is an unauthenticated string inside the encrypted text: **anyone
+on the channel can claim any name**, in this node or any other client. Do not treat a
+received author as identity.
 
 ## Development
 

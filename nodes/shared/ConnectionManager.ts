@@ -155,13 +155,20 @@ export class SharedConnection {
 		}
 	}
 
-	/** Run a command against the connection, serialized behind all prior commands. */
-	run<T>(fn: (connection: MeshConnection) => Promise<T>): Promise<T> {
+	/**
+	 * Run a command against the connection, serialized behind all prior commands.
+	 *
+	 * `timeoutMs` overrides the default command timeout. Most commands are a local
+	 * request/response and finish well inside it; the few that wait on the air from
+	 * inside the meshcore.js call (trace path) must raise the ceiling, or this wrapper
+	 * fires first and masks the specific error the command would have thrown.
+	 */
+	run<T>(fn: (connection: MeshConnection) => Promise<T>, timeoutMs?: number): Promise<T> {
 		const result = this.queue.then(() => {
 			if (!this.connection || !this._connected) {
 				throw new Error(`MeshCore connection ${this.key} is not connected`);
 			}
-			return this.withTimeout(fn(this.connection), this.config.commandTimeoutMs);
+			return this.withTimeout(fn(this.connection), timeoutMs ?? this.config.commandTimeoutMs);
 		});
 		// keep the chain alive regardless of this command's success/failure
 		this.queue = result.then(
