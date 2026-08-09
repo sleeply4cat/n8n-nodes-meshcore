@@ -1,5 +1,7 @@
 import type { INodeProperties } from 'n8n-workflow';
 
+import { utilitiesOperationSelector, utilitiesProperties } from './utilities';
+
 /** displayOptions helper: show a property for a resource + set of operations. */
 const showFor = (resource: string, operations: string[]): INodeProperties['displayOptions'] => ({
 	show: { resource: [resource], operation: operations },
@@ -27,6 +29,7 @@ const resourceSelect: INodeProperties = {
 		{ name: 'Flood Scope', value: 'floodScope' },
 		{ name: 'Message', value: 'message' },
 		{ name: 'Repeater', value: 'repeater' },
+		{ name: 'Utility', value: 'utilities' },
 	],
 	default: 'device',
 };
@@ -40,6 +43,7 @@ const operationSelectors: INodeProperties[] = [
 		displayOptions: { show: { resource: ['device'] } },
 		default: 'getSelfInfo',
 		options: [
+			{ name: 'Export Private Key', value: 'exportPrivateKey', action: 'Export the device private key', description: 'Read the device identity private key so packets addressed to it can be decrypted elsewhere (sensitive)' },
 			{ name: 'Factory Reset', value: 'factoryReset', action: 'Factory reset the device', description: 'Erase the filesystem and reboot (destructive)' },
 			{ name: 'Get Allowed Repeat Frequencies', value: 'getAllowedRepeatFreq', action: 'Get allowed repeat frequencies', description: 'Read the permitted repeater frequency ranges' },
 			{ name: 'Get Auto Add Config', value: 'getAutoAddConfig', action: 'Get auto add config', description: 'Read the automatic contact-add configuration' },
@@ -438,6 +442,15 @@ const fields: INodeProperties[] = [
 		typeOptions: { minValue: 0, maxValue: 9, numberPrecision: 3 },
 		description: 'Airtime budget multiplier, 0-9 (firmware default 1)',
 		displayOptions: showFor('device', ['setTuningParams']),
+	},
+	{
+		displayName: 'I Understand the Risk',
+		name: 'confirmExport',
+		type: 'boolean',
+		default: false,
+		description:
+			'Whether to really export the key. It is the device\'s identity: whoever holds it can read every direct message sent to this node and can send messages as it. The value lands in this execution\'s data and in any log or store the workflow writes to, and it cannot be rotated without re-keying the node and re-adding it to every contact.',
+		displayOptions: showFor('device', ['exportPrivateKey']),
 	},
 	{
 		displayName: 'Stats Type',
@@ -960,4 +973,10 @@ const fields: INodeProperties[] = [
 	},
 ];
 
-export const properties: INodeProperties[] = [resourceSelect, ...operationSelectors, ...fields];
+export const properties: INodeProperties[] = [
+	resourceSelect,
+	...operationSelectors,
+	utilitiesOperationSelector,
+	...fields,
+	...utilitiesProperties,
+];

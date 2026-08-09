@@ -24,7 +24,6 @@ export const PAYLOAD_TYPE_GRP_TXT = 0x05;
 const TXT_TYPE_PLAIN = 0x00;
 const AES_BLOCK = 16;
 const MAC_SIZE = 2;
-const CHANNEL_HASH_SIZE = 1;
 const PACKET_HASH_SIZE = 8;
 const PH_ROUTE_MASK = 0x03;
 const PH_TYPE_SHIFT = 2;
@@ -76,6 +75,37 @@ export function computePacketHash(payloadType: number, payload: Buffer): Buffer 
 }
 
 /**
+ * `Utils::encryptThenMAC`: AES-128-ECB over the zero-padded plaintext, prefixed by two
+ * bytes of HMAC-SHA256 over the ciphertext. The HMAC key is 32 bytes in the firmware
+ * (PUB_KEY_SIZE); for a 128-bit channel the upper 16 are zero.
+ *
+ * The same construction protects group traffic (keyed by the channel secret) and direct
+ * traffic (keyed by the ECDH shared secret), so the codec shares this primitive.
+ */
+export function encryptThenMac(secret: Buffer, plaintext: Buffer): Buffer {
+	if (secret.length < 16) {
+		throw new Error(`secret must be at least 16 bytes (got ${secret.length})`);
+	}
+	const keyField = Buffer.alloc(32);
+	secret.copy(keyField, 0, 0, Math.min(secret.length, 32));
+
+	const ciphertext = aes128EcbEncrypt(keyField.subarray(0, 16), zeroPad16(plaintext));
+	const mac = createHmac('sha256', keyField).update(ciphertext).digest().subarray(0, MAC_SIZE);
+	return Buffer.concat([mac, ciphertext]);
+}
+
+/** SHA256(secret over its real key length)[0] — the firmware's `addChannel()` hash. */
+export function channelHashByte(secret: Buffer): number {
+	const keyLen = secret.length >= 32 ? 32 : 16;
+	return createHash('sha256').update(secret.subarray(0, keyLen)).digest()[0];
+}
+
+/** `Mesh::createGroupDatagram`: channel hash byte, then the encrypted blob. */
+export function composeGroupPayload(secret: Buffer, plaintext: Buffer): Buffer {
+	return Buffer.concat([Buffer.from([channelHashByte(secret)]), encryptThenMac(secret, plaintext)]);
+}
+
+/**
  * The full pipeline for a GRP_TXT broadcast: plaintext → cipher+MAC → wrapped
  * payload → packet hash. Returns both the hash (for matching incoming LogRxData)
  * and the assembled payload (useful for tests / debug).
@@ -86,25 +116,8 @@ export function computeGroupTextPacketHash(
 	text: string,
 	timestamp: number,
 ): { hash: Buffer; payload: Buffer } {
-	if (secret16.length < 16) {
-		throw new Error(`channel secret must be at least 16 bytes (got ${secret16.length})`);
-	}
-	const key = secret16.subarray(0, 16);
-
-	// AES-128-ECB with zero padding (firmware behavior, see Utils::encrypt)
 	const plaintext = composeGroupTextPlaintext(timestamp, advName, text);
-	const padded = zeroPad16(plaintext);
-	const ciphertext = aes128EcbEncrypt(key, padded);
-
-	// HMAC key is 32 bytes in firmware (PUB_KEY_SIZE). For 128-bit channels the
-	// upper 16 bytes are zero — pad accordingly.
-	const hmacKey = Buffer.alloc(32);
-	secret16.subarray(0, 16).copy(hmacKey);
-	const mac = createHmac('sha256', hmacKey).update(ciphertext).digest().subarray(0, MAC_SIZE);
-
-	const chanHash = createHash('sha256').update(key).digest().subarray(0, CHANNEL_HASH_SIZE);
-
-	const payload = Buffer.concat([chanHash, mac, ciphertext]);
+	const payload = composeGroupPayload(secret16, plaintext);
 	return { hash: computePacketHash(PAYLOAD_TYPE_GRP_TXT, payload), payload };
 }
 

@@ -716,6 +716,23 @@ export const operations: Record<string, OperationHandler> = {
 		return OK;
 	},
 	'device:getDeviceInfo': async (conn) => asObject(await call(conn, 'deviceQuery')),
+	'device:exportPrivateKey': async (conn, ctx, i) => {
+		if (!(ctx.getNodeParameter('confirmExport', i, false) as boolean)) {
+			throw new Error(
+				'Export Private Key is gated: switch on "I Understand the Risk" to confirm you want the key in workflow data',
+			);
+		}
+		const key = await call<{ privateKey?: Uint8Array }>(conn, 'exportPrivateKey');
+		const privateKey = Buffer.from(key?.privateKey ?? []);
+		// The reply carries only prv_key, so pair it with the public key for the decoder,
+		// which needs both to identify who a direct message was for.
+		const self = asObject(await call(conn, 'getSelfInfo', 10000));
+		return {
+			privateKey: bytesToHex(privateKey),
+			publicKey: String(self.publicKey ?? ''),
+			advName: String(self.name ?? ''),
+		};
+	},
 	'device:getRadioParams': async (conn) => {
 		// The radio config only comes back on the AppStart handshake, inside SELF_INFO.
 		const info = asObject(await call(conn, 'getSelfInfo', 10000));

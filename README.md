@@ -7,7 +7,8 @@ Community [n8n](https://n8n.io) nodes for controlling a **MeshCore** device over
 Two nodes are provided:
 
 - **MeshCore** — an action node exposing the device's commands (send messages, manage
-  contacts/channels, read stats/telemetry, run diagnostics, repeater admin, …).
+  contacts/channels, read stats/telemetry, run diagnostics, repeater admin, …) plus a
+  **Utility** resource that encodes and decodes raw packets with no device at all.
 - **MeshCore Trigger** — starts a workflow on device events (incoming messages, adverts,
   delivery confirmations, telemetry, traces, …).
 
@@ -44,7 +45,7 @@ connection to the device.
 
 | Resource | Operations |
 |---|---|
-| **Device** | Get Self Info, Get Device Info, Get/Set Radio Parameters, Get Battery Voltage, Get/Set/Sync Device Time, Set Advert Name, Set Advert Lat/Long, Set TX Power, Get Stats, Reboot, Set Device Pin, Get/Set Custom Variable(s), Get/Set Tuning Parameters, Get Allowed Repeat Frequencies, Get/Set Auto Add Config, Set Path Hash Mode, Factory Reset |
+| **Device** | Get Self Info, Get Device Info, Get/Set Radio Parameters, Get Battery Voltage, Get/Set/Sync Device Time, Set Advert Name, Set Advert Lat/Long, Set TX Power, Get Stats, Reboot, Set Device Pin, Get/Set Custom Variable(s), Get/Set Tuning Parameters, Get Allowed Repeat Frequencies, Get/Set Auto Add Config, Set Path Hash Mode, Export Private Key, Factory Reset |
 | **Contact** | Get Many, Get by Key, Get Advert Path, Find by Name, Find by Public Key Prefix, Add or Update, Set Path, Reset Path, Share, Export, Import, Remove |
 | **Message** | Send Direct Message (toggle: Reliable Delivery), Send Direct Message and Await Reply (toggle: Reliable Delivery), Send Channel Message (toggle: Reliable Delivery), Send Channel Message With Custom Nickname (toggle: Reliable Delivery), Await Delivery, Get Waiting Messages, Sync Next Message |
 | **Channel** | Get Channel, Get Many, Set, Delete, Send Data, Find by Name, Find by Secret |
@@ -52,6 +53,7 @@ connection to the device.
 | **Diagnostics** | Get Status, Get Telemetry, Get Neighbours, Trace Path, Send Binary Request, Send Path Discovery, Discover Path, Await Event, Send Raw Data, Send Raw Packet |
 | **Repeater** | Login, Logout, Has Connection, Sign Data, Send CLI Command, Send Anonymous Request, Send Control Data |
 | **Flood Scope** | Set Scope, Clear Scope, Get Default, Set Default |
+| **Utility** | Decode Packet, and Encode for every payload type: ACK, Advert, Anonymous Request, Channel Datagram, Channel Message, Control Data, Direct Datagram, Direct Message, Multipart, Path Return, Raw Custom, Raw Frame, Trace — all without a device |
 
 Binary fields (public keys, secrets, payloads, signatures) are entered/returned as **hex
 strings**.
@@ -130,6 +132,75 @@ single synchronous node, so you don't need a second trigger plus shared state:
 Message text type (Plain / CLI Data / Signed Plain) is selectable on the direct-send
 operations. Public keys, secrets and paths are hex strings on both input and output, so a
 received message's sender key pipes straight into a send node.
+
+## Utility resource — decoding and encoding packets
+
+These operations never open a connection, so they work equally on frames from the
+trigger's **Raw Data** / **Log RX Data** sniffer events, from an MQTT bridge, or from a
+capture file. Credentials are optional on the node for exactly this reason; the other
+resources ask for the device only when they actually run.
+
+**Decode Packet** takes the frame as hex and returns the header fields, route type,
+payload type, hop path, payload, and the mesh's own packet hash. On top of that:
+
+| Given | You get |
+|---|---|
+| nothing | Advert contents (name, node type, location, public key), ACK codes, dest/src hashes, route and path |
+| **Channel Secrets** | Channel message author and text, channel datagram bytes |
+| **Private Keys** + **Peer Public Keys** | Direct message text, requests/responses, returned paths |
+
+**Packet Types** filters the stream: non-matching frames produce no output item, so a
+busy sniffer feed can be narrowed without a downstream IF.
+
+Keys are node parameters rather than credentials on purpose — a key is a decoding input
+here, and listing several is what lets one workflow read traffic for several identities on
+one radio.
+
+Direct traffic needs both halves. A packet carries only a one-byte sender hash, so the
+sender's full public key has to be known in advance to derive the shared secret; supply
+the contacts you expect to hear from.
+
+The **Encode** operations cover every payload type the firmware defines, and return the
+frame as hex plus its packet hash. Feed that to *Diagnostics → Send Raw Packet* to
+transmit, or to a bridge.
+
+| Needs | Operations |
+|---|---|
+| nothing | ACK, Control Data, Multipart, Raw Custom, Raw Frame, Trace |
+| a channel secret | Channel Message, Channel Datagram |
+| an identity private key | Advert |
+| an identity key **and** the recipient's public key | Direct Message, Direct Datagram (REQ/RESPONSE), Anonymous Request, Path Return |
+
+*Encode Direct Message* also returns `expectedAck`, the four bytes the recipient will send
+back, so it pipes straight into *Message → Await Delivery*.
+
+Set **Path Hash Size** to the mesh's own value (`pathHashSize` from *Device → Get Device
+Info*): every repeater reads that byte to size the hash it appends.
+
+*Encode Advert* signs with the private key you give it, so it can announce an identity the
+device does not own — the basis for running several identities on one radio. Two caveats
+the firmware imposes: an advert without a name is dropped, and a receiver that already
+knows the key ignores any advert whose timestamp is not strictly newer than the last one
+it stored. Keeping that timestamp moving is the workflow's job.
+
+Receiving for an identity the device does not own works **only through the sniffer**:
+`Mesh::onRecvPacket` decrypts direct traffic solely when the destination hash matches the
+device's own key, so anything else never reaches the normal message path. Subscribe to
+**Log RX Data** and decode the frames yourself. Acks, return paths and device-level
+deduplication do not happen for such an identity either.
+
+### About the keys
+
+*Device → Export Private Key* reads the device's identity key, behind an explicit
+confirmation toggle. It is the node's identity — whoever holds it can read every direct
+message addressed to that node and can send messages as it, it lands in the execution's
+data and in whatever the workflow logs, and it cannot be rotated without re-keying the
+node and re-adding it to every contact. Nothing else in this package needs it.
+
+Only advert signatures are authenticated in MeshCore. A channel message's author is a
+plain string inside the encrypted text — any member of the channel can claim any name, so
+treat a decoded author as a label, not an identity. Decode reports `signatureValid` on
+adverts when **Verify Advert Signatures** is on.
 
 ## How it works
 

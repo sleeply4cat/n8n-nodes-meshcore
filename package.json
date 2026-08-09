@@ -19,14 +19,14 @@
 		"url": "https://github.com/sleeply4cat/n8n-nodes-meshcore.git"
 	},
 	"scripts": {
-		"build": "n8n-node build && node scripts/bundle-vendor.mjs",
+		"build": "n8n-node build && node scripts/bundle-vendor.mjs && node scripts/copy-codex.mjs",
 		"build:watch": "tsc --watch",
 		"dev": "n8n-node dev",
 		"lint": "n8n-node lint",
 		"lint:fix": "n8n-node lint --fix",
-		"pretest": "n8n-node build && node scripts/bundle-vendor.mjs",
+		"pretest": "npm run build",
 		"test": "node --test test/*.test.ts",
-		"prepack": "n8n-node build && node scripts/bundle-vendor.mjs",
+		"prepack": "npm run build",
 		"release": "n8n-node release",
 		"prepublishOnly": "n8n-node prerelease"
 	},

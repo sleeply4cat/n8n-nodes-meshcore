@@ -7,9 +7,11 @@ import type {
 import { NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
 
 import { ConnectionManager } from '../shared/ConnectionManager';
+import type { SharedConnection } from '../shared/ConnectionManager';
 import { meshCoreTcpApiTest } from '../shared/credentialTest';
 import { operations } from './operations';
 import { properties } from './properties';
+import { offlineOperations } from './utilities';
 
 export class MeshCore implements INodeType {
 	description: INodeTypeDescription = {
@@ -29,7 +31,10 @@ export class MeshCore implements INodeType {
 		credentials: [
 			{
 				name: 'meshCoreTcpApi',
-				required: true,
+				// Not required: the Utilities operations encode and decode packets without a
+				// device, and demanding credentials for them would be noise. Every other
+				// resource asks for the connection lazily and fails clearly without it.
+				required: false,
 				testedBy: 'meshCoreTcpApiTest',
 			},
 		],
@@ -46,17 +51,37 @@ export class MeshCore implements INodeType {
 		const items = this.getInputData();
 		const returnData: INodeExecutionData[] = [];
 
-		const credentials = await this.getCredentials('meshCoreTcpApi');
-		const host = (credentials.host as string)?.trim();
-		const port = Number(credentials.port) || 5000;
+		// Acquired on first use, so a workflow that only encodes or decodes never opens a
+		// socket — and never kicks a running trigger off the radio (one TCP client only).
+		let connection: SharedConnection | null = null;
+		const connect = async (): Promise<SharedConnection> => {
+			if (!connection) {
+				const credentials = await this.getCredentials('meshCoreTcpApi');
+				const host = (credentials.host as string)?.trim();
+				const port = Number(credentials.port) || 5000;
+				connection = await ConnectionManager.acquire({ host, port });
+			}
+			return connection;
+		};
 
-		const connection = await ConnectionManager.acquire({ host, port });
 		try {
 			for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
 				try {
 					const resource = this.getNodeParameter('resource', itemIndex) as string;
 					const operation = this.getNodeParameter('operation', itemIndex) as string;
-					const handler = operations[`${resource}:${operation}`];
+					const key = `${resource}:${operation}`;
+
+					const offline = offlineOperations[key];
+					if (offline) {
+						const json = await offline(this, itemIndex);
+						// null means the item was filtered out and emits nothing
+						if (json) {
+							returnData.push({ json, pairedItem: itemIndex });
+						}
+						continue;
+					}
+
+					const handler = operations[key];
 					if (!handler) {
 						throw new NodeOperationError(
 							this.getNode(),
@@ -65,7 +90,7 @@ export class MeshCore implements INodeType {
 						);
 					}
 
-					const result = await handler(connection, this, itemIndex);
+					const result = await handler(await connect(), this, itemIndex);
 					const rows = Array.isArray(result) ? result : [result];
 					for (const json of rows) {
 						returnData.push({ json, pairedItem: itemIndex });
@@ -83,7 +108,9 @@ export class MeshCore implements INodeType {
 				}
 			}
 		} finally {
-			ConnectionManager.release(connection);
+			if (connection) {
+				ConnectionManager.release(connection);
+			}
 		}
 
 		return [returnData];

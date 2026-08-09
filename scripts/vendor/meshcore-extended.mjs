@@ -15,6 +15,20 @@
 import TCPConnection from '@liamcottle/meshcore.js/src/connection/tcp_connection.js';
 import BufferWriter from '@liamcottle/meshcore.js/src/buffer_writer.js';
 import BufferReader from '@liamcottle/meshcore.js/src/buffer_reader.js';
+import Packet from '@liamcottle/meshcore.js/src/packet.js';
+import Advert from '@liamcottle/meshcore.js/src/advert.js';
+import CayenneLpp from '@liamcottle/meshcore.js/src/cayenne_lpp.js';
+
+// Re-exported for the packet codec. These cost nothing: `connection.js` already imports
+// them, so they (and the @noble/curves ed25519/x25519 code Advert.isVerified pulls in)
+// are in this bundle whether or not anything else uses them.
+export { Packet, Advert, CayenneLpp };
+
+// The curve primitives behind `Advert.isVerified` and the ECDH used to decrypt direct
+// messages. They must be re-exported from HERE rather than imported in the TypeScript
+// sources: @noble/curves is a devDependency that only exists inside this bundle, so an
+// import anywhere else would put a runtime dependency back into the published package.
+export { ed25519, edwardsToMontgomeryPub, x25519 } from '@noble/curves/ed25519';
 
 const PUB_KEY_SIZE = 32;
 
@@ -30,18 +44,19 @@ const MAX_CHANNEL_SLOTS = 64;
 const CMD = {
 	SET_RADIO_PARAMS: 11,
 	SET_TUNING_PARAMS: 21,
+	EXPORT_PRIVATE_KEY: 23,
 	SEND_RAW_DATA: 25,
-	GET_CHANNEL: 31,
 	HAS_CONNECTION: 28,
 	LOGOUT: 29,
 	GET_CONTACT_BY_KEY: 30,
+	GET_CHANNEL: 31,
+	SEND_TRACE_PATH: 36,
 	SET_DEVICE_PIN: 37,
 	GET_CUSTOM_VARS: 40,
 	SET_CUSTOM_VAR: 41,
 	GET_ADVERT_PATH: 42,
 	GET_TUNING_PARAMS: 43,
 	FACTORY_RESET: 51,
-	SEND_TRACE_PATH: 36,
 	SEND_PATH_DISCOVERY_REQ: 52,
 	SEND_CONTROL_DATA: 55,
 	SEND_ANON_REQ: 57,
@@ -61,6 +76,8 @@ const RESP = {
 	CONTACT: 3,
 	SENT: 6,
 	DEVICE_INFO: 13,
+	PRIVATE_KEY: 14,
+	DISABLED: 15,
 	CHANNEL_INFO: 18,
 	CUSTOM_VARS: 21,
 	ADVERT_PATH: 22,
@@ -512,6 +529,50 @@ class ExtendedTCPConnection extends TCPConnection {
 		w.writeByte(CMD.SET_DEVICE_PIN);
 		w.writeUInt32LE(pin >>> 0);
 		return this._command(w.toBytes(), { resolveCode: RESP.OK, map: () => ({ success: true }) });
+	}
+
+	/**
+	 * Export the device's 64-byte private key (CMD_EXPORT_PRIVATE_KEY).
+	 *
+	 * Replaces meshcore.js's version, which waits only for PRIVATE_KEY and ERR. Firmware
+	 * built without ENABLE_PRIVATE_KEY_EXPORT answers RESP_CODE_DISABLED (15) instead, and
+	 * the base method then hangs until an outer timeout with nothing to explain it.
+	 *
+	 * The reply is `prv_key` only — `LocalIdentity::writeTo` is called with a 64-byte
+	 * budget, which is exactly the private key, so no public key comes with it.
+	 */
+	exportPrivateKey() {
+		const w = new BufferWriter();
+		w.writeByte(CMD.EXPORT_PRIVATE_KEY);
+		return new Promise((resolve, reject) => {
+			let done = false;
+			const finish = (fn, value) => {
+				if (done) return;
+				done = true;
+				this.off(RESP.PRIVATE_KEY, onKey);
+				this.off(RESP.DISABLED, onDisabled);
+				this.off(RESP.ERR, onErr);
+				clearTimeout(timer);
+				fn(value);
+			};
+			const onKey = (payload) => finish(resolve, { privateKey: payload?.privateKey });
+			const onDisabled = () =>
+				finish(
+					reject,
+					new Error(
+						'This firmware was built without ENABLE_PRIVATE_KEY_EXPORT, so the device refuses to hand out its private key',
+					),
+				);
+			const onErr = (payload) => finish(reject, new Error(describeErr(payload)));
+			const timer = setTimeout(
+				() => finish(reject, new Error('timed out waiting for the private key')),
+				10000,
+			);
+			this.on(RESP.PRIVATE_KEY, onKey);
+			this.on(RESP.DISABLED, onDisabled);
+			this.on(RESP.ERR, onErr);
+			this.sendToRadioFrame(w.toBytes()).catch((e) => finish(reject, e));
+		});
 	}
 
 	getCustomVars() {

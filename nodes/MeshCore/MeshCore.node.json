@@ -1,0 +1,28 @@
+{
+	"node": "n8n-nodes-meshcore.meshCore",
+	"nodeVersion": "1.0",
+	"codexVersion": "1.0",
+	"categories": ["Communication", "Utility"],
+	"alias": [
+		"MeshCore",
+		"mesh",
+		"LoRa",
+		"radio",
+		"packet",
+		"decode",
+		"encode",
+		"advert",
+		"channel",
+		"contact",
+		"repeater",
+		"telemetry",
+		"trace"
+	],
+	"resources": {
+		"primaryDocumentation": [
+			{
+				"url": "https://github.com/sleeply4cat/n8n-nodes-meshcore#meshcore-node--operations"
+			}
+		]
+	}
+}

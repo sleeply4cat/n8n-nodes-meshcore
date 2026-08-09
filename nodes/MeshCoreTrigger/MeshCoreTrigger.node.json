@@ -1,0 +1,24 @@
+{
+	"node": "n8n-nodes-meshcore.meshCoreTrigger",
+	"nodeVersion": "1.0",
+	"codexVersion": "1.0",
+	"categories": ["Communication"],
+	"alias": [
+		"MeshCore",
+		"mesh",
+		"LoRa",
+		"radio",
+		"message",
+		"advert",
+		"sniffer",
+		"telemetry",
+		"trace"
+	],
+	"resources": {
+		"primaryDocumentation": [
+			{
+				"url": "https://github.com/sleeply4cat/n8n-nodes-meshcore#meshcore-trigger-node--events"
+			}
+		]
+	}
+}
