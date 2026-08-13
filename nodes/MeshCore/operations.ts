@@ -13,6 +13,7 @@ import {
 	parseRxFrame,
 } from '../shared/channelHash';
 import { enrichContactRecord, encodePathLen, OUT_PATH_UNKNOWN } from '../shared/contactPath';
+import { decodePacket } from '../shared/packetCodec';
 
 /**
  * One action-node operation. Reads its parameters from the execution context for the
@@ -103,6 +104,36 @@ const OK: IDataObject = { success: true };
  * error message.
  */
 const TRACE_COMMAND_CEILING_MS = 30000;
+
+/** PERM_ACL_* role in the low two bits of a client's permissions byte (ClientACL.h). */
+const ACL_ROLES: Record<number, string> = {
+	0: 'guest',
+	1: 'read-only',
+	2: 'read-write',
+	3: 'admin',
+};
+
+/**
+ * Send a binary request to a node and return its response bytes. Shared by the operations
+ * that wrap a specific REQ_TYPE_*, so they all get the same timeout handling.
+ */
+async function binaryRequest(
+	conn: SharedConnection,
+	ctx: IExecuteFunctions,
+	i: number,
+	request: Buffer,
+): Promise<Buffer> {
+	const extraTimeoutMs = num(ctx, 'extraTimeoutMs', i);
+	const response = await callWithTimeout<Uint8Array>(
+		conn,
+		'sendBinaryRequest',
+		TRACE_COMMAND_CEILING_MS + extraTimeoutMs,
+		hexToBytes(str(ctx, 'contactPublicKey', i)),
+		request,
+		extraTimeoutMs,
+	);
+	return Buffer.from(response ?? []);
+}
 
 const str = (ctx: IExecuteFunctions, name: string, i: number): string =>
 	ctx.getNodeParameter(name, i) as string;
@@ -765,6 +796,17 @@ export const operations: Record<string, OperationHandler> = {
 		await call(conn, 'setRadioParams', freqKhz, bandwidthHz, spreadingFactor, codingRate, clientRepeat);
 		return OK;
 	},
+	'device:setOtherParams': async (conn, ctx, i) => {
+		await call(conn, 'setOtherParams', {
+			manualAddContacts: ctx.getNodeParameter('manualAddContacts', i, false) as boolean,
+			telemetryModeBase: num(ctx, 'telemetryModeBase', i),
+			telemetryModeLoc: num(ctx, 'telemetryModeLoc', i),
+			telemetryModeEnv: num(ctx, 'telemetryModeEnv', i),
+			advertLocPolicy: num(ctx, 'advertLocPolicy', i),
+			multiAcks: num(ctx, 'multiAcks', i),
+		});
+		return OK;
+	},
 	'device:setTuningParams': async (conn, ctx, i) => {
 		const rxDelayBase = num(ctx, 'rxDelayBase', i);
 		const airtimeFactor = num(ctx, 'airtimeFactor', i);
@@ -831,7 +873,20 @@ export const operations: Record<string, OperationHandler> = {
 	'contact:export': async (conn, ctx, i) => {
 		const hex = str(ctx, 'exportPublicKey', i).trim();
 		const arg = hex ? hexToBytes(hex) : null;
-		return asObject(await call(conn, 'exportContact', arg));
+		const exported = asObject(await call(conn, 'exportContact', arg));
+		// The export IS an advert packet, so decode it rather than hand back only hex:
+		// name, node type, location, public key, and whether the signature holds.
+		const packetHex = String(exported.advertPacketBytes ?? '');
+		if (!packetHex) {
+			return exported;
+		}
+		try {
+			const decoded = await decodePacket(Buffer.from(packetHex, 'hex'), { verifyAdverts: true });
+			return { ...exported, advert: (decoded.parsed ?? {}) as IDataObject };
+		} catch {
+			// a packet we cannot parse is still worth returning as bytes
+			return exported;
+		}
 	},
 	'contact:import': async (conn, ctx, i) => {
 		await call(conn, 'importContact', hexToBytes(str(ctx, 'advertPacket', i)));
@@ -1254,10 +1309,71 @@ export const operations: Record<string, OperationHandler> = {
 	},
 
 	// --- Diagnostics ----------------------------------------------------------
-	'diagnostics:getStatus': async (conn, ctx, i) =>
-		asObject(await call(conn, 'getStatus', hexToBytes(str(ctx, 'contactPublicKey', i)))),
-	'diagnostics:getTelemetry': async (conn, ctx, i) =>
-		asObject(await call(conn, 'getTelemetry', hexToBytes(str(ctx, 'contactPublicKey', i)))),
+	'repeater:getStatus': async (conn, ctx, i) => {
+		const extraTimeoutMs = num(ctx, 'extraTimeoutMs', i);
+		return asObject(
+			await callWithTimeout(
+				conn,
+				'getStatus',
+				TRACE_COMMAND_CEILING_MS + extraTimeoutMs,
+				hexToBytes(str(ctx, 'contactPublicKey', i)),
+				extraTimeoutMs,
+			),
+		);
+	},
+	'diagnostics:getTelemetry': async (conn, ctx, i) => {
+		const extraTimeoutMs = num(ctx, 'extraTimeoutMs', i);
+		// getTelemetry waits for the reply inside meshcore.js, for the device's airtime
+		// estimate plus this extra, so the queue ceiling has to clear it.
+		return asObject(
+			await callWithTimeout(
+				conn,
+				'getTelemetry',
+				TRACE_COMMAND_CEILING_MS + extraTimeoutMs,
+				hexToBytes(str(ctx, 'contactPublicKey', i)),
+				extraTimeoutMs,
+			),
+		);
+	},
+	'device:getSelfTelemetry': async (conn) => asObject(await call(conn, 'getSelfTelemetry')),
+	'repeater:getAccessList': async (conn, ctx, i) => {
+		// REQ_TYPE_GET_ACCESS_LIST, then two reserved bytes the firmware requires to be 0
+		const response = await binaryRequest(conn, ctx, i, Buffer.from([0x05, 0x00, 0x00, 0x00]));
+		const clients: IDataObject[] = [];
+		// entries are a 6-byte public key prefix followed by one permissions byte
+		for (let offset = 0; offset + 7 <= response.length; offset += 7) {
+			const permissions = response[offset + 6];
+			// The reply is encrypted, and the cipher zero-pads to a block, so the tail can
+			// hold a partial run of zeros. A zero permissions byte is also how the firmware
+			// marks a deleted entry, so skipping it covers both.
+			if (permissions === 0) {
+				continue;
+			}
+			clients.push({
+				publicKeyPrefix: bytesToHex(response.subarray(offset, offset + 6)),
+				permissions,
+				role: ACL_ROLES[permissions & 0x03] ?? 'unknown',
+			});
+		}
+		return { clients, count: clients.length };
+	},
+	'repeater:getOwnerInfo': async (conn, ctx, i) => {
+		const response = await binaryRequest(conn, ctx, i, Buffer.from([0x07, 0x00, 0x00, 0x00]));
+		// The repeater sprintf()s "<firmware>\n<node name>\n<owner info>". The reply is
+		// encrypted, so the cipher's zero padding rides along on the end — cut it off.
+		const nul = response.indexOf(0);
+		const text = response.subarray(0, nul === -1 ? response.length : nul).toString('utf8');
+		const [firmwareVersion = '', nodeName = '', ...rest] = text.split('\n');
+		return { firmwareVersion, nodeName, ownerInfo: rest.join('\n'), raw: text };
+	},
+	'repeater:getAvgMinMax': async (conn, ctx, i) => {
+		const request = Buffer.alloc(9);
+		request[0] = 0x04; // REQ_TYPE_GET_AVG_MIN_MAX
+		request.writeUInt32LE(num(ctx, 'startSecsAgo', i) >>> 0, 1);
+		request.writeUInt32LE(num(ctx, 'endSecsAgo', i) >>> 0, 5);
+		const response = await binaryRequest(conn, ctx, i, request);
+		return { responseData: bytesToHex(response) };
+	},
 	'diagnostics:tracePath': async (conn, ctx, i) => {
 		const extraTimeoutMs = num(ctx, 'extraTimeoutMs', i);
 		// 0 = auto: ask the device for its path-hash mode. A route whose hop size does not
@@ -1291,18 +1407,23 @@ export const operations: Record<string, OperationHandler> = {
 			),
 		);
 	},
-	'diagnostics:getNeighbours': async (conn, ctx, i) =>
-		asObject(
-			await call(
+	'repeater:getNeighbours': async (conn, ctx, i) => {
+		const extraTimeoutMs = num(ctx, 'extraTimeoutMs', i);
+		// getNeighbours goes through sendBinaryRequest, which waits on the air; without a
+		// raised ceiling a distant repeater trips the queue timeout instead of answering.
+		return asObject(
+			await callWithTimeout(
 				conn,
 				'getNeighbours',
+				TRACE_COMMAND_CEILING_MS + extraTimeoutMs,
 				hexToBytes(str(ctx, 'contactPublicKey', i)),
 				num(ctx, 'count', i),
 				num(ctx, 'offset', i),
 				num(ctx, 'orderBy', i),
 				num(ctx, 'publicKeyPrefixLength', i),
 			),
-		),
+		);
+	},
 	'diagnostics:sendBinaryRequest': async (conn, ctx, i) => {
 		const responseData = await call<Uint8Array>(
 			conn,
@@ -1362,7 +1483,7 @@ export const operations: Record<string, OperationHandler> = {
 	// --- Repeater -------------------------------------------------------------
 	'repeater:login': async (conn, ctx, i) =>
 		asObject(await call(conn, 'login', hexToBytes(str(ctx, 'contactPublicKey', i)), str(ctx, 'password', i))),
-	'repeater:sign': async (conn, ctx, i) => {
+	'device:sign': async (conn, ctx, i) => {
 		const signature = await call<Uint8Array>(conn, 'sign', hexToBytes(str(ctx, 'data', i)));
 		return { signature: bytesToHex(signature) };
 	},

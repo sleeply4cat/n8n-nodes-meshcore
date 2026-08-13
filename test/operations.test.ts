@@ -419,7 +419,7 @@ test('contact:findByName returns found:false when not found', async () => {
 test('call() throws a clear error when meshcore.js lacks the method', async () => {
 	const conn = new FakeConn({}) as any; // mesh has no getStatus
 	await assert.rejects(
-		operations['diagnostics:getStatus'](conn, fakeCtx({ contactPublicKey: 'aabb' }), 0),
+		operations['repeater:getStatus'](conn, fakeCtx({ contactPublicKey: 'aabb' }), 0),
 		/does not implement "getStatus"/,
 	);
 });
@@ -444,10 +444,10 @@ test('contact:addOrUpdate forwards mapped fields with derived outPathLen', async
 	assert.deepEqual(result, { success: true });
 });
 
-test('repeater:sign returns a hex signature', async () => {
+test('device:sign returns a hex signature', async () => {
 	const mesh = { sign: async () => new Uint8Array([0xde, 0xad, 0xbe, 0xef]) };
 	const conn = new FakeConn(mesh) as any;
-	const result = await operations['repeater:sign'](conn, fakeCtx({ data: '00' }), 0);
+	const result = await operations['device:sign'](conn, fakeCtx({ data: '00' }), 0);
 	assert.deepEqual(result, { signature: 'deadbeef' });
 });
 
@@ -458,7 +458,7 @@ test('contact:setPath returns found:false when the contact is missing', async ()
 	assert.deepEqual(result, { found: false });
 });
 
-test('diagnostics:getNeighbours forwards pagination args', async () => {
+test('repeater:getNeighbours forwards pagination args', async () => {
 	let args: unknown[] = [];
 	const mesh = {
 		getNeighbours: async (...a: unknown[]) => {
@@ -469,7 +469,7 @@ test('diagnostics:getNeighbours forwards pagination args', async () => {
 	const conn = new FakeConn(mesh) as any;
 	const ctx = fakeCtx({ contactPublicKey: 'aabb', count: 5, offset: 2, orderBy: 1, publicKeyPrefixLength: 4 });
 
-	await operations['diagnostics:getNeighbours'](conn, ctx, 0);
+	await operations['repeater:getNeighbours'](conn, ctx, 0);
 
 	assert.equal(Buffer.from(args[0] as Uint8Array).toString('hex'), 'aabb');
 	assert.deepEqual(args.slice(1), [5, 2, 1, 4]);

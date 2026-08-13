@@ -45,6 +45,9 @@ const CMD = {
 	SET_RADIO_PARAMS: 11,
 	SET_TUNING_PARAMS: 21,
 	EXPORT_PRIVATE_KEY: 23,
+	SEND_STATUS_REQ: 27,
+	SET_OTHER_PARAMS: 38,
+	SEND_TELEMETRY_REQ: 39,
 	SEND_RAW_DATA: 25,
 	HAS_CONNECTION: 28,
 	LOGOUT: 29,
@@ -74,6 +77,7 @@ const RESP = {
 	OK: 0,
 	ERR: 1,
 	CONTACT: 3,
+	SELF_INFO: 5,
 	SENT: 6,
 	DEVICE_INFO: 13,
 	PRIVATE_KEY: 14,
@@ -89,7 +93,9 @@ const RESP = {
 
 // Async push codes (device -> host) not modelled by meshcore.js constants.
 const PUSH = {
+	STATUS_RESPONSE: 0x87,
 	TRACE_DATA: 0x89,
+	TELEMETRY_RESPONSE: 0x8b,
 	PATH_DISCOVERY_RESPONSE: 0x8d,
 	CONTROL_DATA: 0x8e,
 	CONTACT_DELETED: 0x8f,
@@ -139,6 +145,53 @@ function decodePackedPathLen(byte) {
 	const hops = byte & 0x3f;
 	const hashSize = (byte >> 6) + 1;
 	return { hops, hashSize, bytes: hops * hashSize };
+}
+
+/**
+ * `struct RepeaterStats` (simple_repeater/MyMesh.h). Every field is naturally aligned, so
+ * the struct is written without padding and can be read straight off the wire.
+ *
+ * The struct has grown over firmware versions, so this reads only what is actually there
+ * and leaves later fields undefined rather than misreading the tail.
+ */
+function parseRepeaterStats(bytes) {
+	const b = Buffer.from(bytes);
+	const out = { rawBytes: b.length };
+	const read = (size, offset, fn) => (b.length >= offset + size ? fn(offset) : null);
+
+	out.batteryMilliVolts = read(2, 0, (o) => b.readUInt16LE(o));
+	out.txQueueLen = read(2, 2, (o) => b.readUInt16LE(o));
+	out.noiseFloor = read(2, 4, (o) => b.readInt16LE(o));
+	out.lastRssi = read(2, 6, (o) => b.readInt16LE(o));
+	out.packetsReceived = read(4, 8, (o) => b.readUInt32LE(o));
+	out.packetsSent = read(4, 12, (o) => b.readUInt32LE(o));
+	out.totalAirTimeSecs = read(4, 16, (o) => b.readUInt32LE(o));
+	out.uptimeSecs = read(4, 20, (o) => b.readUInt32LE(o));
+	out.sentFlood = read(4, 24, (o) => b.readUInt32LE(o));
+	out.sentDirect = read(4, 28, (o) => b.readUInt32LE(o));
+	out.receivedFlood = read(4, 32, (o) => b.readUInt32LE(o));
+	out.receivedDirect = read(4, 36, (o) => b.readUInt32LE(o));
+	out.errorEvents = read(2, 40, (o) => b.readUInt16LE(o));
+	// stored multiplied by 4, like every other SNR in the protocol
+	const snrRaw = read(2, 42, (o) => b.readInt16LE(o));
+	out.lastSnr = snrRaw === null ? null : snrRaw / 4;
+	out.directDuplicates = read(2, 44, (o) => b.readUInt16LE(o));
+	out.floodDuplicates = read(2, 46, (o) => b.readUInt16LE(o));
+	out.totalRxAirTimeSecs = read(4, 48, (o) => b.readUInt32LE(o));
+	out.receiveErrors = read(4, 52, (o) => b.readUInt32LE(o));
+	// Anything past the struct we know is a field a newer firmware added. Surface it as
+	// bytes rather than drop it silently, so it is visible that there is more to read.
+	out.trailingBytes = b.length > 56 ? toHex(b.subarray(56)) : '';
+	return out;
+}
+
+/** Cayenne LPP sensor readings, as `CayenneLpp.parse` returns them. */
+function parseLpp(bytes) {
+	try {
+		return CayenneLpp.parse(bytes) ?? [];
+	} catch {
+		return [];
+	}
 }
 
 /** Read a packed-path-len byte + its REAL byte payload, returning {pathLen, hops, hashSize, path}. */
@@ -217,6 +270,46 @@ class ExtendedTCPConnection extends TCPConnection {
 					pathHashSize: pathHashMode == null ? null : pathHashMode + 1,
 				});
 			},
+			// meshcore.js reads three bytes here as `reserved`, but the firmware puts real
+			// settings in them (MyMesh.cpp, the CMD_APP_START reply) — the same three that
+			// CMD_SET_OTHER_PARAMS writes. Everything else matches its parser.
+			[RESP.SELF_INFO]: (r) => {
+				const type = r.readByte();
+				const txPower = toInt8(r.readByte());
+				const maxTxPower = r.readByte();
+				const publicKey = toHex(r.readBytes(PUB_KEY_SIZE));
+				const advLat = r.readInt32LE();
+				const advLon = r.readInt32LE();
+				const multiAcks = r.readByte();
+				const advertLocPolicy = r.readByte();
+				const telemetryModes = r.readByte();
+				const manualAddContacts = r.readByte();
+				const radioFreq = r.readUInt32LE();
+				const radioBw = r.readUInt32LE();
+				const radioSf = r.readByte();
+				const radioCr = r.readByte();
+				const name = Buffer.from(r.readRemainingBytes()).toString('utf8');
+				this.emit(RESP.SELF_INFO, {
+					type,
+					txPower,
+					maxTxPower,
+					publicKey,
+					advLat,
+					advLon,
+					multiAcks,
+					advertLocPolicy,
+					// packed as (env << 4) | (loc << 2) | base, two bits each
+					telemetryModeBase: telemetryModes & 0x03,
+					telemetryModeLoc: (telemetryModes >> 2) & 0x03,
+					telemetryModeEnv: (telemetryModes >> 4) & 0x03,
+					manualAddContacts,
+					radioFreq,
+					radioBw,
+					radioSf,
+					radioCr,
+					name,
+				});
+			},
 			[RESP.TUNING_PARAMS]: (r) => {
 				const rxDelayBase = r.readUInt32LE() / 1000;
 				const airtimeFactor = r.readUInt32LE() / 1000;
@@ -272,6 +365,31 @@ class ExtendedTCPConnection extends TCPConnection {
 					pathHashes,
 					pathSnrs,
 					lastSnr,
+				});
+			},
+			// meshcore.js hands `statusData` back as raw bytes. It is a RepeaterStats struct
+			// — uptime, packet counters, duplicates, airtime — which is the whole point of
+			// asking for status, so decode it and keep the bytes alongside.
+			[PUSH.STATUS_RESPONSE]: (r) => {
+				r.readByte(); // reserved
+				const pubKeyPrefix = toHex(r.readBytes(6));
+				const statusData = Buffer.from(r.readRemainingBytes());
+				this.emit(PUSH.STATUS_RESPONSE, {
+					publicKeyPrefix: pubKeyPrefix,
+					...parseRepeaterStats(statusData),
+					statusData: toHex(statusData),
+				});
+			},
+			// same idea: the payload is Cayenne LPP, and meshcore.js ships a parser for it
+			// that nothing was calling.
+			[PUSH.TELEMETRY_RESPONSE]: (r) => {
+				r.readByte(); // reserved
+				const pubKeyPrefix = toHex(r.readBytes(6));
+				const lpp = Buffer.from(r.readRemainingBytes());
+				this.emit(PUSH.TELEMETRY_RESPONSE, {
+					publicKeyPrefix: pubKeyPrefix,
+					telemetry: parseLpp(lpp),
+					lppSensorData: toHex(lpp),
 				});
 			},
 			// async pushes the base class also drops
@@ -573,6 +691,130 @@ class ExtendedTCPConnection extends TCPConnection {
 			this.on(RESP.ERR, onErr);
 			this.sendToRadioFrame(w.toBytes()).catch((e) => finish(reject, e));
 		});
+	}
+
+	/**
+	 * Send a request that is answered later by a push carrying the responder's 6-byte key
+	 * prefix, and wait for the one that matches.
+	 *
+	 * Replaces the shape meshcore.js uses for getStatus and getTelemetry, which rejects
+	 * with the bare string "timeout" and with `undefined` on a device ERR — both of which
+	 * collapse into one opaque message — and arms no timer until SENT arrives, so a lost
+	 * SENT hangs forever. It also matched on a Buffer field that only existed to be
+	 * matched; ours matches the hex prefix the parsers already emit.
+	 */
+	_awaitPrefixedPush(bytes, { pushCode, prefixHex, extraTimeoutMs, label }) {
+		return new Promise((resolve, reject) => {
+			let done = false;
+			let timer = null;
+			const finish = (fn, value) => {
+				if (done) return;
+				done = true;
+				this.off(RESP.SENT, onSent);
+				this.off(RESP.ERR, onErr);
+				this.off(pushCode, onPush);
+				clearTimeout(timer);
+				fn(value);
+			};
+			timer = setTimeout(
+				() => finish(reject, new Error(`MeshCore device did not acknowledge the ${label} request`)),
+				SEND_ACK_TIMEOUT_MS,
+			);
+			const onSent = (payload) => {
+				const estTimeout = payload?.estTimeout ?? 0;
+				const waited = estTimeout + extraTimeoutMs;
+				clearTimeout(timer);
+				this.off(RESP.ERR, onErr); // an ERR now is not about a request already on the air
+				timer = setTimeout(
+					() =>
+						finish(
+							reject,
+							new Error(
+								`MeshCore ${label} request was sent but no reply arrived within ${waited}ms ` +
+									`(device estimate ${estTimeout}ms + extra timeout ${extraTimeoutMs}ms). ` +
+									'Raise "Extra Timeout (Ms)", or check the node is reachable and you are logged in.',
+							),
+						),
+					waited,
+				);
+			};
+			const onPush = (payload) => {
+				if (payload?.publicKeyPrefix === prefixHex) finish(resolve, payload);
+			};
+			const onErr = (payload) =>
+				finish(reject, new Error(`MeshCore device rejected the ${label} request: ${describeErr(payload)}`));
+
+			this.on(RESP.SENT, onSent);
+			this.on(RESP.ERR, onErr);
+			this.on(pushCode, onPush);
+			this.sendToRadioFrame(bytes).catch((e) => finish(reject, e));
+		});
+	}
+
+	getStatus(pubKey, extraTimeoutMs = 5000) {
+		const key = Buffer.from(pubKey);
+		const w = new BufferWriter();
+		w.writeByte(CMD.SEND_STATUS_REQ);
+		w.writeBytes(key.subarray(0, PUB_KEY_SIZE));
+		return this._awaitPrefixedPush(w.toBytes(), {
+			pushCode: PUSH.STATUS_RESPONSE,
+			prefixHex: toHex(key.subarray(0, 6)),
+			extraTimeoutMs,
+			label: 'status',
+		});
+	}
+
+	getTelemetry(pubKey, extraTimeoutMs = 5000) {
+		const key = Buffer.from(pubKey);
+		const w = new BufferWriter();
+		w.writeByte(CMD.SEND_TELEMETRY_REQ);
+		w.writeByte(0);
+		w.writeByte(0);
+		w.writeByte(0);
+		w.writeBytes(key.subarray(0, PUB_KEY_SIZE));
+		return this._awaitPrefixedPush(w.toBytes(), {
+			pushCode: PUSH.TELEMETRY_RESPONSE,
+			prefixHex: toHex(key.subarray(0, 6)),
+			extraTimeoutMs,
+			label: 'telemetry',
+		});
+	}
+
+	/**
+	 * Ask the device for ITS OWN telemetry — battery plus whatever sensors it has.
+	 *
+	 * The firmware answers a 4-byte CMD_SEND_TELEMETRY_REQ (opcode plus three reserved
+	 * bytes, no public key) straight from its own sensors, with no radio traffic, no
+	 * contact and no login. meshcore.js cannot ask for it: `sendCommandSendTelemetryReq`
+	 * always appends a 32-byte key, so the short frame is unreachable through it.
+	 */
+	getSelfTelemetry(timeoutMs = 10000) {
+		const w = new BufferWriter();
+		w.writeByte(CMD.SEND_TELEMETRY_REQ);
+		w.writeByte(0);
+		w.writeByte(0);
+		w.writeByte(0);
+		return this._command(w.toBytes(), {
+			resolveCode: PUSH.TELEMETRY_RESPONSE,
+			timeoutMs,
+		});
+	}
+
+	/**
+	 * `CMD_SET_OTHER_PARAMS` — the write side of the three fields the SELF_INFO reply
+	 * reports. Trailing fields are optional in the firmware, and it keeps whatever it
+	 * already had for the ones we do not send.
+	 */
+	setOtherParams({ manualAddContacts, telemetryModeBase, telemetryModeLoc, telemetryModeEnv, advertLocPolicy, multiAcks }) {
+		const w = new BufferWriter();
+		w.writeByte(CMD.SET_OTHER_PARAMS);
+		w.writeByte(manualAddContacts ? 1 : 0);
+		w.writeByte(
+			((telemetryModeEnv & 0x03) << 4) | ((telemetryModeLoc & 0x03) << 2) | (telemetryModeBase & 0x03),
+		);
+		w.writeByte(advertLocPolicy & 0xff);
+		w.writeByte(multiAcks & 0xff);
+		return this._command(w.toBytes(), { resolveCode: RESP.OK, map: () => ({ success: true }) });
 	}
 
 	getCustomVars() {

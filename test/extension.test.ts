@@ -405,6 +405,131 @@ test('setTuningParams encodes both fields as milli-units', async () => {
 	assert.deepEqual(await promise, { success: true });
 });
 
+test('onFrameReceived parses STATUS_RESPONSE (0x87) into RepeaterStats fields', async () => {
+	const conn = new ExtendedTCPConnection('127.0.0.1', 5000);
+	let payload: any = null;
+	conn.on(0x87, (p: unknown) => { payload = p; });
+
+	// captured from a live repeater: 60 bytes, i.e. 4 past the struct we know
+	const stats =
+		'640f000099fffaffe1d90000c4230000c50e000079730500bd210000070200002ba500009534000000002f0009043283a94d00008c20000000000000';
+	conn.onFrameReceived(
+		Uint8Array.from([0x87, 0x00, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0x5e, ...Buffer.from(stats, 'hex')]),
+	);
+	await tick();
+
+	assert.equal(payload.publicKeyPrefix, 'dddddddddd5e');
+	assert.equal(payload.batteryMilliVolts, 3940);
+	assert.equal(payload.noiseFloor, -103);
+	assert.equal(payload.lastRssi, -6);
+	assert.equal(payload.packetsReceived, 55777);
+	assert.equal(payload.uptimeSecs, 357241);
+	assert.equal(payload.lastSnr, 11.75, 'SNR is stored times four');
+	assert.equal(payload.floodDuplicates, 33586);
+	assert.equal(payload.receiveErrors, 8332);
+	assert.equal(payload.trailingBytes, '00000000', 'bytes past the known struct are surfaced');
+	assert.equal(payload.statusData, stats, 'raw bytes are kept alongside');
+});
+
+test('STATUS_RESPONSE leaves later fields null when the struct is short', async () => {
+	const conn = new ExtendedTCPConnection('127.0.0.1', 5000);
+	let payload: any = null;
+	conn.on(0x87, (p: unknown) => { payload = p; });
+
+	// only the first four 16-bit fields present
+	conn.onFrameReceived(
+		Uint8Array.from([0x87, 0x00, 1, 2, 3, 4, 5, 6, ...Buffer.from('640f000099fffaff', 'hex')]),
+	);
+	await tick();
+
+	assert.equal(payload.batteryMilliVolts, 3940);
+	assert.equal(payload.packetsReceived, null, 'absent field reads as unknown, not garbage');
+	assert.equal(payload.trailingBytes, '');
+});
+
+test('onFrameReceived parses TELEMETRY_RESPONSE (0x8b) and decodes the LPP payload', async () => {
+	const conn = new ExtendedTCPConnection('127.0.0.1', 5000);
+	let payload: any = null;
+	conn.on(0x8b, (p: unknown) => { payload = p; });
+
+	// channel 1, type 116 (LPP_VOLTAGE), value 0 — as the device itself reports on USB
+	conn.onFrameReceived(
+		Uint8Array.from([0x8b, 0x00, 0xd8, 0x83, 0xd5, 0x84, 0x84, 0x9e, 0x01, 0x74, 0x00, 0x00]),
+	);
+	await tick();
+
+	assert.equal(payload.publicKeyPrefix, 'd883d584849e');
+	assert.equal(payload.lppSensorData, '01740000');
+	assert.deepEqual(payload.telemetry, [{ channel: 1, type: 116, value: 0 }]);
+	assert.equal(payload.pubKeyPrefix, undefined, 'no duplicate of the prefix under a second name');
+});
+
+test('onFrameReceived parses SELF_INFO, naming the bytes meshcore.js calls reserved', async () => {
+	const conn = new ExtendedTCPConnection('127.0.0.1', 5000);
+	let payload: any = null;
+	conn.on(5, (p: unknown) => { payload = p; });
+
+	conn.onFrameReceived(
+		Uint8Array.from([
+			5,
+			1, // adv type
+			20, // tx power
+			22, // max tx power
+			...Array(32).fill(0xab), // public key
+			...le32(0), ...le32(0), // lat, lon
+			2, // multi_acks
+			1, // advert_loc_policy
+			(3 << 4) | (2 << 2) | 1, // telemetry modes: env, loc, base
+			1, // manual_add_contacts
+			...le32(869525), ...le32(250000), // freq kHz, bw Hz
+			11, 5, // sf, cr
+			...Buffer.from('KOT', 'utf8'),
+		]),
+	);
+	await tick();
+
+	assert.equal(payload.multiAcks, 2);
+	assert.equal(payload.advertLocPolicy, 1);
+	assert.equal(payload.telemetryModeBase, 1);
+	assert.equal(payload.telemetryModeLoc, 2);
+	assert.equal(payload.telemetryModeEnv, 3);
+	assert.equal(payload.manualAddContacts, 1);
+	assert.equal(payload.radioFreq, 869525);
+	assert.equal(payload.radioSf, 11);
+	assert.equal(payload.name, 'KOT');
+	assert.equal(payload.reserved, undefined, 'the three bytes are named, not lumped together');
+});
+
+test('getSelfTelemetry sends the short 4-byte frame the firmware needs', async () => {
+	const conn = new ExtendedTCPConnection('127.0.0.1', 5000);
+	let captured: Uint8Array | null = null;
+	conn.sendToRadioFrame = async (bytes: Uint8Array) => { captured = bytes; };
+
+	const promise = conn.getSelfTelemetry();
+	assert.equal(captured!.length, 4, 'no public key: that is what selects self telemetry');
+	assert.equal(captured![0], 39, 'opcode is CMD_SEND_TELEMETRY_REQ');
+
+	conn.emit(0x8b, { publicKeyPrefix: 'aabbccddeeff', telemetry: [], lppSensorData: '' });
+	assert.equal((await promise).publicKeyPrefix, 'aabbccddeeff');
+});
+
+test('getTelemetry ignores a reply for a different node and names a timeout', async () => {
+	const conn = new ExtendedTCPConnection('127.0.0.1', 5000);
+	conn.sendToRadioFrame = async () => {};
+	const key = Buffer.alloc(32, 0xab);
+
+	const promise = conn.getTelemetry(key, 30);
+	await tick();
+	conn.emit(6, { result: 0, expectedAckCrc: 0, estTimeout: 20 });
+	conn.emit(0x8b, { publicKeyPrefix: '112233445566', telemetry: [] }); // someone else's
+
+	await assert.rejects(promise, (e: unknown) => {
+		assert.ok(e instanceof Error, 'a real Error, not the bare string meshcore.js throws');
+		assert.match((e as Error).message, /telemetry request was sent but no reply arrived within 50ms/);
+		return true;
+	});
+});
+
 test('onFrameReceived parses TRACE_DATA (0x89) with path_sz-sized SNR list', async () => {
 	const conn = new ExtendedTCPConnection('127.0.0.1', 5000);
 	let payload: any = null;

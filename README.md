@@ -45,13 +45,13 @@ connection to the device.
 
 | Resource | Operations |
 |---|---|
-| **Device** | Get Self Info, Get Device Info, Get/Set Radio Parameters, Get Battery Voltage, Get/Set/Sync Device Time, Set Advert Name, Set Advert Lat/Long, Set TX Power, Get Stats, Reboot, Set Device Pin, Get/Set Custom Variable(s), Get/Set Tuning Parameters, Get Allowed Repeat Frequencies, Get/Set Auto Add Config, Set Path Hash Mode, Export Private Key, Factory Reset |
+| **Device** | Get Self Info, Get Device Info, Get/Set Radio Parameters, Get Battery Voltage, Get/Set/Sync Device Time, Set Advert Name, Set Advert Lat/Long, Set TX Power, Get Stats, Reboot, Set Device Pin, Get/Set Custom Variable(s), Get/Set Tuning Parameters, Get Allowed Repeat Frequencies, Get/Set Auto Add Config, Set Path Hash Mode, Set Other Parameters, Sign Data, Get Self Telemetry, Export Private Key, Factory Reset |
 | **Contact** | Get Many, Get by Key, Get Advert Path, Find by Name, Find by Public Key Prefix, Add or Update, Set Path, Reset Path, Share, Export, Import, Remove |
 | **Message** | Send Direct Message (toggle: Reliable Delivery), Send Direct Message and Await Reply (toggle: Reliable Delivery), Send Channel Message (toggle: Reliable Delivery), Send Channel Message With Custom Nickname (toggle: Reliable Delivery), Await Delivery, Get Waiting Messages, Sync Next Message |
 | **Channel** | Get Channel, Get Many, Set, Delete, Send Data, Find by Name, Find by Secret |
 | **Advert** | Send Flood Advert, Send Zero-Hop Advert |
-| **Diagnostics** | Get Status, Get Telemetry, Get Neighbours, Trace Path, Send Binary Request, Send Path Discovery, Discover Path, Await Event, Send Raw Data, Send Raw Packet |
-| **Repeater** | Login, Logout, Has Connection, Sign Data, Send CLI Command, Send Anonymous Request, Send Control Data |
+| **Diagnostics** | Get Telemetry, Trace Path, Send Binary Request, Send Path Discovery, Discover Path, Await Event, Send Raw Data, Send Raw Packet |
+| **Repeater** | Login, Logout, Has Connection, Get Status, Get Neighbours, Get Access List, Get Owner Info, Get Avg Min Max, Send CLI Command, Send Anonymous Request, Send Control Data |
 | **Flood Scope** | Set Scope, Clear Scope, Get Default, Set Default |
 | **Utility** | Decode Packet, and Encode for every payload type: ACK, Advert, Anonymous Request, Channel Datagram, Channel Message, Control Data, Direct Datagram, Direct Message, Multipart, Path Return, Raw Custom, Raw Frame, Trace — all without a device |
 
@@ -202,6 +202,27 @@ plain string inside the encrypted text — any member of the channel can claim a
 treat a decoded author as a label, not an identity. Decode reports `signatureValid` on
 adverts when **Verify Advert Signatures** is on.
 
+## Asking a repeater for things
+
+A repeater answers requests only from a node it knows, so the sequence is: have it in
+your contacts (catch its advert, or *Contact → Add or Update*), then *Repeater → Login*
+(an empty password is a guest login), then ask.
+
+| Operation | Notes |
+|---|---|
+| *Get Status* | Uptime, packet and duplicate counters, airtime, battery, noise floor — decoded, with the raw bytes kept alongside |
+| *Get Telemetry* | Cayenne LPP readings. A guest gets base telemetry only; the firmware masks the rest by role |
+| *Get Neighbours* | Who the repeater hears, with SNR and how long ago. Returns nothing if its firmware was built without neighbour tracking |
+| *Get Access List* | Its client list and roles — **admin only** |
+| *Get Owner Info* | Firmware version, node name, owner text |
+| *Get Avg Min Max* | Sensor nodes only; repeaters do not implement it |
+
+*Get Self Telemetry* is the exception: it reads this device's own battery and sensors with
+no radio traffic, no contact and no login.
+
+All of these wait for a reply that travels over the air, so each carries **Extra Timeout
+(Ms)** — raise it for a distant node rather than reading the timeout as a failure.
+
 ## How it works
 
 The WiFi companion firmware accepts **exactly one TCP client at a time** and drops the
@@ -280,6 +301,20 @@ Run once against real hardware to validate the device-dependent paths:
    *Get by Key*.
 8. **Reconnect** — power-cycle/disconnect the device and confirm a running trigger
    reconnects and resumes.
+
+## Breaking changes (0.8.0)
+
+Three operations moved to the resource they actually belong to. A workflow using any of
+them needs its MeshCore node re-configured — the operation itself behaves identically.
+
+| Was | Now | Why |
+|---|---|---|
+| Diagnostics → Get Status | **Repeater → Get Status** | Only a repeater, room server or sensor answers it; a plain companion does not |
+| Diagnostics → Get Neighbours | **Repeater → Get Neighbours** | Repeater only |
+| Repeater → Sign Data | **Device → Sign Data** | Signs with *this* device's key; it never involves a repeater |
+
+*Get Telemetry* stays in Diagnostics because it is the one request a plain companion does
+answer (`MyMesh::onContactRequest` handles that type and no other).
 
 ## Breaking changes (0.3.0)
 
