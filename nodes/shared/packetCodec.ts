@@ -171,11 +171,10 @@ export function parsePathPlaintext(plaintext: Buffer): Record<string, unknown> {
 	const hashSize = (pathLen >> 6) + 1;
 	const hops = pathLen & 0x3f;
 	const pathBytes = hops * hashSize;
-	if (1 + pathBytes > plaintext.length) return { pathLen, hops, pathHashSize: hashSize };
+	if (1 + pathBytes > plaintext.length) return { hops, pathHashSize: hashSize };
 	const path = plaintext.subarray(1, 1 + pathBytes);
 	const rest = plaintext.subarray(1 + pathBytes);
 	return {
-		pathLen,
 		hops,
 		pathHashSize: hashSize,
 		returnPath: path.toString('hex'),
@@ -216,6 +215,8 @@ export interface DecodeOptions {
 }
 
 export interface DecodedPacket {
+	/** The whole frame as given, so a filtered item can still be forwarded verbatim. */
+	packet: string;
 	routeType: number;
 	routeTypeName: string | null;
 	payloadType: number;
@@ -223,7 +224,8 @@ export interface DecodedPacket {
 	payloadVersion: number;
 	transportCode1: number | null;
 	transportCode2: number | null;
-	pathLen: number;
+	// The packed path_len byte is not surfaced: it reads as a hop count (0x40 = "64")
+	// when it is really hashSize-1 (top 2 bits) and hops (low 6), both given below.
 	hops: number;
 	pathHashSize: number;
 	path: string;
@@ -327,6 +329,7 @@ export async function decodePacket(
 	const payload = Buffer.from(packet.payload);
 
 	const out: DecodedPacket = {
+		packet: hex(bytes),
 		routeType: packet.route_type,
 		routeTypeName: packet.route_type_string,
 		payloadType: packet.payload_type,
@@ -335,7 +338,6 @@ export async function decodePacket(
 		payloadVersion: packet.payload_version,
 		transportCode1: packet.transportCode1,
 		transportCode2: packet.transportCode2,
-		pathLen: packet.pathLen,
 		hops: packet.getPathHashCount(),
 		pathHashSize: packet.getPathHashSize(),
 		path: hex(packet.path),

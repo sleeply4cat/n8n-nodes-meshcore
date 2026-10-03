@@ -18,8 +18,9 @@ Two nodes are provided:
 ## Requirements
 
 - A self-hosted n8n instance.
-- **Node.js 22** (the build tooling — `@n8n/node-cli` — requires Node ≥ 20.12; Node 22 LTS
-  is the tested version. Node 26 is too new for a native build dependency).
+- To develop: **Node.js 22** for install/build/test (`@n8n/node-cli` requires Node ≥ 20.12,
+  and the dev dependency `isolated-vm@6` does not compile on Node 26). Running current n8n
+  itself (2.37+) needs Node ≥ 24 — see Development.
 - A MeshCore device running `companion_radio_wifi`, reachable over your LAN on TCP
   (default port `5000`).
 
@@ -93,8 +94,9 @@ the raw `pathLen`** from the output:
 
 - `via` — `"direct"` if the message arrived along the stored route, `"flood"` otherwise.
 - `hops` — `0` for direct, the actual hop count for flood.
-- `pathHashSize` — only on flood, the bytes-per-hop hash size (1–4); useful for routing
-  debug.
+
+The path itself is not available: the firmware's message frames carry only that byte,
+not the route's hash bytes, so there is no path (or per-hop hash size) to report.
 
 ### Note on the New Advert event
 
@@ -141,7 +143,9 @@ capture file. Credentials are optional on the node for exactly this reason; the 
 resources ask for the device only when they actually run.
 
 **Decode Packet** takes the frame as hex and returns the header fields, route type,
-payload type, hop path, payload, and the mesh's own packet hash. On top of that:
+payload type, hop path, payload, and the mesh's own packet hash. The input frame comes
+back as `packet` (normalised hex, the same field the encoders output), so a workflow can
+decode, filter on the fields, and forward the original bytes. On top of that:
 
 | Given | You get |
 |---|---|
@@ -280,8 +284,30 @@ to stop). `N8N_USER_MANAGEMENT_DISABLED` was removed from n8n, so a pre-provisio
 (`N8N_INSTANCE_OWNER_MANAGED_BY_ENV` + a bcrypt password hash) is the supported way to get
 a fixed dev login.
 
+n8n 2.37+ refuses to start on Node < 24, so the script runs on the bundled
+`node-v26.2.0-linux-x64/` by default (override with `NODE_BIN=/path/to/node/bin`). That
+only affects the local build and the test n8n; the plugin's output targets es2020/node18.
+If n8n fails with "IsolatePool failed to create any bridges", its `isolated-vm` was built
+under a different Node: run `npm rebuild isolated-vm` in its `~/.npm/_npx/<hash>` folder
+with the same Node on `PATH`.
+
 Manual alternative: `npm run build && npm link`, then in `~/.n8n/custom` run
 `npm link n8n-nodes-meshcore`, and restart n8n.
+
+### Releasing
+
+Releases are published by `.github/workflows/publish.yml` with npm Trusted Publishing
+(no npm token exists anywhere) and a provenance attestation, which n8n requires of
+community nodes. Bump the version in a `Release vX.Y.Z` commit, then:
+
+```bash
+git tag vX.Y.Z
+git push origin main vX.Y.Z
+```
+
+and approve the `npm` deployment in the Actions tab. The workflow refuses a tag that does
+not match `package.json`. Its header lists the one-time npm and GitHub settings it relies
+on and what each of them protects against.
 
 ## Manual device test checklist
 
@@ -301,6 +327,24 @@ Run once against real hardware to validate the device-dependent paths:
    *Get by Key*.
 8. **Reconnect** — power-cycle/disconnect the device and confirm a running trigger
    reconnects and resumes.
+
+## Breaking changes (0.9.0)
+
+Packed `path_len` bytes are no longer output. Read as a number they look like a hop
+count — a direct flood packet with 2-byte hashes showed `pathLen: 64` — when they are
+really the hash size and the hop count packed together. Both are already output as their
+own fields, so use those:
+
+| Where | Removed | Use instead |
+|---|---|---|
+| Contact → Get Many / Get by Key / Find by Name / Find by Public Key Prefix, Trigger → New Advert | `outPathLen` (`-1` meant "no route stored") | `outPathHops`, `outPathHashSize` (both `null` when no route is stored) |
+| Utility → Decode Packet | `pathLen` (also inside a decrypted PATH packet) | `hops`, `pathHashSize` |
+| Contact → Get Advert Path | `pathLen` | `hops`, `hashSize` |
+| Trigger → Path Discovery Response, Diagnostics → Discover Path | `outPathLen`, `inPathLen` | `outPathHops` / `outPathHashSize`, `inPathHops` / `inPathHashSize` |
+| Trigger → Control Data | `pathLen` | `hops` |
+
+Also new: Decode Packet returns its input frame as `packet`, so a workflow can decode,
+filter on the fields and forward the original bytes.
 
 ## Breaking changes (0.8.0)
 

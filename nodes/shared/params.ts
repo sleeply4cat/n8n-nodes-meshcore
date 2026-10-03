@@ -21,7 +21,7 @@ export function bytesToHex(bytes: Uint8Array | number[]): string {
  * Map of meshcore.js short-form output keys to the long form used by this package's UI
  * and outputs. Kept narrow: rename only fields where meshcore.js has a clear short-form
  * variant of a name we use elsewhere in long form. Wider firmware shorthands (advLat,
- * outPathLen, etc.) stay as-is — they have no dual form anywhere in the codebase.
+ * advLon, etc.) stay as-is — they have no dual form anywhere in the codebase.
  */
 const KEY_RENAMES: Record<string, string> = {
 	pubKeyPrefix: 'publicKeyPrefix',

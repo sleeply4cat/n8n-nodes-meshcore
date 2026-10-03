@@ -61,7 +61,7 @@ const eventTransforms: Record<string, (payload: IDataObject) => IDataObject> = {
 	// NewAdvert (0x8A) carries a full contact record (publicKey, type, flags,
 	// outPathLen, outPath, advName, lat/lon, …). Apply the same outPath decoding
 	// the action-side Get Many / Get by Key ops use so workflows don't see a
-	// 64-byte tail of garbage and have hops/hashSize at hand.
+	// 64-byte tail of garbage, and get hops/hashSize instead of the packed byte.
 	newAdvert: (payload) => enrichContactRecord({ ...payload }) as IDataObject,
 };
 

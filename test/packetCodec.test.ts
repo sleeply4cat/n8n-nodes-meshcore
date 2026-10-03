@@ -154,7 +154,6 @@ test('parsePathPlaintext decodes the returned route', () => {
 	// packed path_len 0x42 -> 2-byte hashes, 2 hops -> 4 path bytes, then extra_type + extra
 	const pt = Buffer.from('42aabbccdd07ff', 'hex');
 	assert.deepEqual(parsePathPlaintext(pt), {
-		pathLen: 0x42,
 		hops: 2,
 		pathHashSize: 2,
 		returnPath: 'aabbccdd',
@@ -167,10 +166,12 @@ test('decodePacket reads a group text frame and decrypts it with the right secre
 	const { frame, hash } = buildGroupTextPacket(SECRET, 'Bot', 'hello', 1000, 2);
 
 	const decoded = await decodePacket(frame, { channels: [{ name: 'HOME', secret: SECRET }] });
+	assert.equal(decoded.packet, frame.toString('hex'), 'the input frame is passed through');
 	assert.equal(decoded.payloadTypeName, 'GRP_TXT');
 	assert.equal(decoded.routeTypeName, 'FLOOD');
 	assert.equal(decoded.pathHashSize, 2);
 	assert.equal(decoded.hops, 0);
+	assert.equal('pathLen' in decoded, false, 'the packed byte would read as 64 hops');
 	assert.equal(decoded.packetHash, hash.toString('hex'), 'hash matches the builder');
 	assert.deepEqual(decoded.decrypted, {
 		channelName: 'HOME',
@@ -440,7 +441,6 @@ test('composePathPlaintext round trips through parsePathPlaintext', () => {
 		Buffer.from('ff', 'hex'),
 	);
 	assert.deepEqual(parsePathPlaintext(plaintext), {
-		pathLen,
 		hops: 2,
 		pathHashSize: 2,
 		returnPath: 'aabbccdd',

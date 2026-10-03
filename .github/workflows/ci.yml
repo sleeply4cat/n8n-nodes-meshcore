@@ -1,10 +1,15 @@
 name: CI
 
+# `pull_request` (never `pull_request_target`): a fork's PR runs with a read-only token
+# and no secrets, so its code has nothing to steal.
 on:
   pull_request:
   push:
     branches:
       - main
+
+permissions:
+  contents: read
 
 # Cancel in-progress runs for the same branch/PR to avoid wasting CI minutes.
 concurrency:
@@ -16,19 +21,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: 'lts/*'
-          cache: 'npm'
+          persist-credentials: false
+
+      # Node 22: the toolchain the project is built and tested with (isolated-vm@6, a dev
+      # dependency, does not compile on Node 26).
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --no-audit --no-fund
 
       - name: Run lint
         run: npm run lint
 
-      - name: Run build
-        run: npm run build
+      - name: Run tests
+        run: npm test # pretest builds

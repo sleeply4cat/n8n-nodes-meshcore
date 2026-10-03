@@ -81,8 +81,8 @@ function asObjectArray(value: unknown): IDataObject[] {
 }
 
 /**
- * Normalize a contact for output (Get Many / Find / Get by Key). Decoding of
- * `outPathLen` + `outPath` lives in `shared/contactPath.ts` because the trigger
+ * Normalize a contact for output (Get Many / Find / Get by Key). Decoding of the
+ * packed `outPathLen` + `outPath` lives in `shared/contactPath.ts` because the trigger
  * does the same enrichment for the NewAdvert push (which carries the same
  * contact-record shape).
  */

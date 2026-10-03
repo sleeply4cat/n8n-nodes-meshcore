@@ -213,6 +213,7 @@ test('contact output decodes packed outPathLen and trims outPath to real byte le
 	assert.equal(r.outPath, 'a0a1a2a3a4a5', 'outPath sized as hops*hashSize, no trailing garbage');
 	assert.equal(r.outPathHops, 3);
 	assert.equal(r.outPathHashSize, 2);
+	assert.equal('outPathLen' in r, false, 'the packed byte is not surfaced');
 });
 
 test('contact output: OUT_PATH_UNKNOWN (-1) produces empty outPath and null hops', async () => {
@@ -232,6 +233,7 @@ test('contact output: OUT_PATH_UNKNOWN (-1) produces empty outPath and null hops
 	assert.equal(r.outPath, '', 'no path stored → empty hex');
 	assert.equal(r.outPathHops, null);
 	assert.equal(r.outPathHashSize, null);
+	assert.equal('outPathLen' in r, false, 'the -1 sentinel is not surfaced');
 });
 
 test('channel:getAll drops unconfigured (empty-name) channels', async () => {
@@ -925,6 +927,7 @@ test('startSubscriptions transforms newAdvert payload (decodes outPath + hops/ha
 	const p = caught[0].payload;
 	assert.equal(p.outPathHops, 3, 'decoded hops');
 	assert.equal(p.outPathHashSize, 2, 'decoded hash size');
+	assert.equal('outPathLen' in p, false, 'the packed byte is not surfaced');
 	// outPath is still a Buffer at the transform stage; trigger.emit normalizes it later.
 	assert.ok(p.outPath instanceof Uint8Array || Buffer.isBuffer(p.outPath));
 	assert.equal(p.outPath.length, 6, 'outPath truncated to hops*hashSize');

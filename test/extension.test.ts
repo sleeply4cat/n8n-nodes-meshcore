@@ -87,7 +87,7 @@ test('onFrameReceived parses CONTROL_DATA push (0x8e) with signed snr/rssi + dec
 
 	assert.equal(payload.snr, -1);
 	assert.equal(payload.rssi, -50);
-	assert.equal(payload.pathLen, 0x43);
+	assert.equal('pathLen' in payload, false, 'the packed byte is not surfaced');
 	assert.equal(payload.hops, 3);
 	assert.equal(payload.hashSize, undefined, 'no path bytes in this frame → hashSize would be meaningless');
 	assert.equal(payload.payload, 'dead');
@@ -103,7 +103,7 @@ test('onFrameReceived parses ADVERT_PATH (22) honoring packed pathLen byte count
 	conn.onFrameReceived(Uint8Array.from([22, ...ts, 0x43, ...path]));
 	await tick();
 	assert.equal(payload.recvTimestamp, 0x11223344);
-	assert.equal(payload.pathLen, 0x43);
+	assert.equal('pathLen' in payload, false, 'the packed byte is not surfaced');
 	assert.equal(payload.hops, 3);
 	assert.equal(payload.hashSize, 2);
 	assert.equal(payload.path, 'aabbccddeeff');
@@ -126,6 +126,7 @@ test('onFrameReceived parses PATH_DISCOVERY_RESPONSE (0x8d) with both packed pat
 	assert.equal(payload.inPath, 'ccdd');
 	assert.equal(payload.inPathHops, 1);
 	assert.equal(payload.inPathHashSize, 2);
+	assert.equal('outPathLen' in payload || 'inPathLen' in payload, false, 'packed bytes not surfaced');
 });
 
 test('getChannel encodes [CMD 31, idx] and resolves only on the matching channelIdx', async () => {

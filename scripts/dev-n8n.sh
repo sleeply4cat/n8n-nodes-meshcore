@@ -11,13 +11,15 @@
 # way to disable the login screen, so we pre-provision a known owner instead.
 # N8N_INSTANCE_OWNER_PASSWORD_HASH must be a bcrypt hash (plaintext breaks login).
 #
-# Usage:  scripts/dev-n8n.sh [port]
+# Usage:  [NODE_BIN=/path/to/node/bin] scripts/dev-n8n.sh [port]
 # Stop:   Ctrl+C
 #
 set -uo pipefail
 
 PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NODE_BIN="/home/kirill/111/progr/JS/n8n-mesh/node-v22.22.3-linux-x64/bin"
+# n8n 2.37+ requires Node >= 24. The plugin's own output targets es2020/node18, so the
+# Node used here only affects the local build and the test n8n, not what users run.
+NODE_BIN="${NODE_BIN:-/home/kirill/111/progr/JS/n8n-mesh/node-v26.2.0-linux-x64/bin}"
 export PATH="$NODE_BIN:$PATH"
 
 PORT="${1:-5678}"
@@ -76,6 +78,10 @@ http_code() { curl -s -o /dev/null -w '%{http_code}' "$@" 2>/dev/null || echo 00
 echo -n "==> Waiting for n8n + MeshCore nodes"
 ok=""
 for _ in $(seq 1 150); do
+  if ! kill -0 "$N8N_PID" 2>/dev/null; then
+    wait "$N8N_PID"; code=$?
+    echo; echo "n8n exited before it was ready (exit $code) — see its output above."; exit 1
+  fi
   [ "$(http_code "$BASE/rest/settings")" = "200" ] || { echo -n "."; sleep 2; continue; }
   cookie=$(curl -s -i -X POST "$BASE/rest/login" -H 'content-type: application/json' \
     -d "{\"emailOrLdapLoginId\":\"$EMAIL\",\"password\":\"$PASSWORD\"}" 2>/dev/null \
@@ -90,7 +96,8 @@ echo
 if [ -n "$ok" ]; then
   echo "    login OK + nodes registered:"; echo "$nodes" | sed 's/^/      /'
 else
-  echo "    WARNING: could not confirm login/nodes (n8n still running). See /tmp/meshcore-build.log."
+  echo "    ERROR: n8n is up but login or the MeshCore nodes could not be confirmed. Stopping it."
+  kill "$N8N_PID" 2>/dev/null; wait "$N8N_PID" 2>/dev/null; exit 1
 fi
 
 cat <<EOF

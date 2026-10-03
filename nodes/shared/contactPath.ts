@@ -48,8 +48,9 @@ export function encodePathLen(hops: number, hashSize = 1): number {
  * buffer (Contact responses, NewAdvert push, getContactByKey, …):
  *  - truncate `outPath` to its REAL byte length (hops * hashSize), dropping the
  *    uninitialized tail the firmware sends after the actual route bytes.
- *  - add `outPathHops` / `outPathHashSize` decoded from the packed byte
- *    (`null` for the OUT_PATH_UNKNOWN sentinel).
+ *  - replace the packed byte with `outPathHops` / `outPathHashSize` (`null` for the
+ *    OUT_PATH_UNKNOWN sentinel). The byte itself is dropped: as a number it reads
+ *    like a hop count (0x43 = "67", unknown = -1), and the two fields hold all of it.
  *
  * Returns the same object instance for chaining.
  */
@@ -60,6 +61,7 @@ export function enrichContactRecord(record: Record<string, unknown>): Record<str
 		const bytes = decoded?.bytes ?? 0;
 		record.outPath = Buffer.from(path as Uint8Array).subarray(0, bytes);
 	}
+	delete record.outPathLen;
 	record.outPathHops = decoded ? decoded.hops : null;
 	record.outPathHashSize = decoded ? decoded.hashSize : null;
 	return record;

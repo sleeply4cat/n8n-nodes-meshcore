@@ -194,12 +194,15 @@ function parseLpp(bytes) {
 	}
 }
 
-/** Read a packed-path-len byte + its REAL byte payload, returning {pathLen, hops, hashSize, path}. */
+/**
+ * Read a packed-path-len byte + its REAL byte payload, returning {hops, hashSize, path}.
+ * The packed byte itself is not returned: surfaced as-is it reads as a hop count
+ * (0x43 = "67") when it is really hashSize-1 and hops, both given here.
+ */
 function readPackedPath(reader) {
-	const pathLen = reader.readByte();
-	const { hops, hashSize, bytes } = decodePackedPathLen(pathLen);
+	const { hops, hashSize, bytes } = decodePackedPathLen(reader.readByte());
 	const path = bytes > 0 ? toHex(reader.readBytes(bytes)) : '';
-	return { pathLen, hops, hashSize, path };
+	return { hops, hashSize, path };
 }
 
 class ExtendedTCPConnection extends TCPConnection {
@@ -238,8 +241,8 @@ class ExtendedTCPConnection extends TCPConnection {
 				// Firmware writes `hops * hashSize` real bytes via Packet::writePath, not the
 				// raw byte; reading `pathLen` bytes as the previous code did over-reads (and
 				// breaks trailing-field parsing) whenever hashSize > 1.
-				const { pathLen, hops, hashSize, path } = readPackedPath(r);
-				this.emit(RESP.ADVERT_PATH, { recvTimestamp, pathLen, hops, hashSize, path });
+				const { hops, hashSize, path } = readPackedPath(r);
+				this.emit(RESP.ADVERT_PATH, { recvTimestamp, hops, hashSize, path });
 			},
 			// meshcore.js parses this frame against a much older firmware: it takes
 			// `manufacturerModel` as "remainder of frame", which swallows the manufacturer
@@ -402,11 +405,9 @@ class ExtendedTCPConnection extends TCPConnection {
 				this.emit(PUSH.PATH_DISCOVERY_RESPONSE, {
 					pubKeyPrefix,
 					outPath: out.path,
-					outPathLen: out.pathLen,
 					outPathHops: out.hops,
 					outPathHashSize: out.hashSize,
 					inPath: inp.path,
-					inPathLen: inp.pathLen,
 					inPathHops: inp.hops,
 					inPathHashSize: inp.hashSize,
 				});
@@ -417,10 +418,9 @@ class ExtendedTCPConnection extends TCPConnection {
 				// path_len is packed (hops + hashSize), but only `hops` is meaningful here:
 				// the firmware does not include the path bytes in this frame, only the
 				// payload, so the hash size would be a number without a path to apply to.
-				const pathLen = r.readByte();
-				const { hops } = decodePackedPathLen(pathLen);
+				const { hops } = decodePackedPathLen(r.readByte());
 				const payload = toHex(r.readRemainingBytes());
-				this.emit(PUSH.CONTROL_DATA, { snr, rssi, pathLen, hops, payload });
+				this.emit(PUSH.CONTROL_DATA, { snr, rssi, hops, payload });
 			},
 			[PUSH.CONTACT_DELETED]: (r) => {
 				this.emit(PUSH.CONTACT_DELETED, { publicKey: toHex(r.readBytes(PUB_KEY_SIZE)) });
