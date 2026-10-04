@@ -125,3 +125,10 @@ jobs:
       # for local use and must not run here.
       - name: Publish
         run: npm publish ./*.tgz --provenance --ignore-scripts
+
+      # When the Trusted Publishing exchange fails, npm logs the reason only at verbose
+      # level and falls through to a bare ENEEDAUTH. Surface those lines (they carry no
+      # credentials) from its debug log.
+      - name: Show why Trusted Publishing failed
+        if: failure()
+        run: grep -h 'oidc' ~/.npm/_logs/*-debug-*.log || echo 'no oidc lines in the npm debug log'
